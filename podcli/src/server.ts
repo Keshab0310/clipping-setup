@@ -1,0 +1,3355 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+
+import {
+  transcribeToolDef,
+  handleTranscribe,
+  transcribeStartToolDef,
+  handleTranscribeStart,
+  jobStatusToolDef,
+  handleJobStatus,
+  processEpisodeToolDef,
+  handleProcessEpisode,
+} from "./handlers/transcribe.handler.js";
+import {
+  compareEnginesToolDef,
+  handleCompareEngines,
+} from "./handlers/compare-engines.handler.js";
+import {
+  suggestClipsToolDef,
+  suggestClipsInputFields,
+  handleSuggestClips,
+  rankClipCandidatesToolDef,
+  handleRankClipCandidates,
+  hookSchema,
+} from "./handlers/suggest-clips.handler.js";
+import {
+  createClipToolDef,
+  handleCreateClip,
+} from "./handlers/create-clip.handler.js";
+import {
+  batchClipsToolDef,
+  handleBatchClips,
+} from "./handlers/batch-clips.handler.js";
+import { registerIntegrationMcpTools } from "./handlers/integrations.handler.js";
+import { mineChannelToolDef, handleMineChannel } from "./handlers/mine-channel.handler.js";
+import { isHttpUrl } from "./utils/ytdlp-args.js";
+import { KnowledgeBase } from "./services/knowledge-base.js";
+import { AssetManager, inferType } from "./services/asset-manager.js";
+import { ClipsHistory } from "./services/clips-history.js";
+import { TranscriptCache } from "./services/transcript-cache.js";
+import { EpisodeState } from "./services/episode-state.js";
+import { paths } from "./config/paths.js";
+import { readUIStateFile } from "./services/ui-state-file.js";
+import { webServerUrl } from "./config/server.js";
+import { childLogger } from "./utils/logger.js";
+import { mcpError } from "./utils/errors.js";
+import { transcriptVideoMismatch } from "./utils/video-identity.js";
+import { podcliVersion, studioStartCommand } from "./version.js";
+import { FORMATS } from "./models/index.js";
+import type { ClipHook, SuggestedClip, UIState } from "./models/index.js";
+
+const log = childLogger("server");
+
+/**
+ * Fire-and-forget notification to the optional Web UI.
+ * Never throws: the UI may not be running, which is expected.
+ */
+const transcriptCache = new TranscriptCache();
+
+/**
+ * Only a studio that isn't listening may be retried inline. A render that
+ * started and then failed, timed out, or went missing must surface: retrying it
+ * would render the same clips twice.
+ */
+function studioUnreachable(msg: string, label: string): boolean {
+  if (!msg.includes("ECONNREFUSED") && !msg.includes("fetch failed")) return false;
+  log.warn(
+    `Studio not reachable at ${webServerUrl}. Running ${label} inline without live progress. If the studio listens on another port, set PODCLI_PORT for this MCP server too.`,
+  );
+
+  return true;
+}
+
+async function uiPing(body: UIState): Promise<void> {
+  try {
+    await fetch(`${webServerUrl}/api/ui-state`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    log.debug("UI ping failed (Web UI likely not running)", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+const kb = new KnowledgeBase();
+const assets = new AssetManager();
+const history = new ClipsHistory();
+const episodeState = new EpisodeState();
+
+/** Prepend knowledge base file listing to a tool result. */
+async function withKnowledge(result: string): Promise<string> {
+  try {
+    const files = await kb.listFiles();
+
+    if (!files.length) return result;
+    const listing = files.map((f) => f.filename).join(", ");
+
+    return `[Knowledge Base: ${listing}. Use the knowledge_base tool to read specific files]\n\n${result}`;
+  } catch {
+    return result;
+  }
+}
+
+/** Append a workflow next-step hint to a tool result. */
+function withNextStep(result: string, nextStep: string): string {
+  return `${result}\n\n---\n[Next Step] ${nextStep}`;
+}
+
+// Fallback transcript views (no packed markdown available) can be 500KB+ for a
+// long episode; cap what goes into a tool response.
+const TRANSCRIPT_FALLBACK_CAP = 50_000;
+
+// Every other tool's schema uses z.object's default behavior, which strips
+// an unknown key silently, so a caller passing captions: true instead of
+// captions_enabled gets no error and nothing recorded. record_decisions is
+// strict on purpose: it's meant to be the durable record of a decision, so a
+// typo'd key should fail loudly rather than quietly not stick.
+const recordDecisionsInputFields = {
+  video_path: z.string().describe("The episode's source video path (same path used with set_video/transcribe_podcast)"),
+  clip_count: z.number().optional().describe("How many clips to produce"),
+  clip_duration_min: z.number().optional().describe("Minimum target clip duration in seconds"),
+  clip_duration_max: z.number().optional().describe("Maximum target clip duration in seconds"),
+  caption_style: z.enum(["hormozi", "karaoke", "subtle", "branded"]).optional(),
+  captions_enabled: z.boolean().optional().describe("Whether clips should have captions burned in at all"),
+  language: z.string().optional().describe("The episode's spoken language"),
+  thumbnails_wanted: z.boolean().optional(),
+  delivery_target: z.string().optional().describe("Where clips are headed, e.g. youtube_shorts, tiktok, instagram, export_only"),
+  notes: z.string().optional().describe("Free-form notes that don't fit another field"),
+};
+
+export const recordDecisionsInputSchema = z.strictObject(recordDecisionsInputFields, {
+  // Returning undefined keeps zod's own message for every other issue.
+  error: (issue) =>
+    issue.code === "unrecognized_keys"
+      ? `Unknown field(s): ${issue.keys.join(", ")}. Valid fields: ` +
+        Object.keys(recordDecisionsInputFields).join(", ")
+      : undefined,
+});
+
+function capTranscriptText(text: string): string {
+  if (text.length <= TRANSCRIPT_FALLBACK_CAP) return text;
+
+  return (
+    text.slice(0, TRANSCRIPT_FALLBACK_CAP) +
+    `\n\n[Transcript truncated: showing the first ${TRANSCRIPT_FALLBACK_CAP} of ${text.length} characters. ` +
+    "Use parse_transcript or transcribe_podcast to generate the packed view for full coverage.]"
+  );
+}
+
+/**
+ * Read UI state from the optional Web UI server.
+ * Returns null when the UI isn't running (expected in headless mode).
+ *
+ * NOTE: The returned shape also includes a few fields the Web UI writes
+ * (transcriptWordCount, etc.) that aren't part of the canonical UIState
+ * model. We widen UIState locally for those extras.
+ */
+interface ServerUIState extends UIState {
+  transcriptWordCount?: number;
+}
+
+const captionStyleSchema = z.enum(["hormozi", "karaoke", "subtle", "branded"]);
+
+const resultEngineSchema = z.looseObject({ engine: z.string().optional() });
+
+const webJobSchema = z.looseObject({
+  job_id: z.string(),
+  status: z.enum(["pending", "running", "done", "error"]),
+  result: z.unknown().optional(),
+  error: z.string().optional(),
+});
+
+const outputClipsSchema = z.array(
+  z.looseObject({
+    filename: z.string(),
+    size_mb: z.number(),
+    created: z.string().optional(),
+  }),
+);
+
+const apiErrorSchema = z.looseObject({ error: z.string().optional() });
+
+const apiResponseSchema = z.looseObject({
+  error: z.string().optional(),
+  job_id: z.string().optional(),
+  outputs: z
+    .looseObject({
+      validation: z.looseObject({ warnings: z.array(z.string()).optional() }).optional(),
+    })
+    .optional(),
+});
+
+const cropStrategySchema = z.enum(["center", "face", "speaker"]);
+const formatSchema = z.enum(FORMATS);
+
+function exportClipFromSuggestion(
+  s: SuggestedClip,
+  fallbackTitle: string,
+  settings: NonNullable<UIState["settings"]>,
+) {
+  return {
+    start_second: s.start_second,
+    end_second: s.end_second,
+    title: s.title || fallbackTitle,
+    caption_style: captionStyleSchema.catch("hormozi").parse(s.suggested_caption_style || settings.captionStyle),
+    crop_strategy: cropStrategySchema.catch("speaker").parse(settings.cropStrategy),
+    format: formatSchema.catch("vertical").parse(settings.format),
+    allow_ass_fallback: false,
+    ...(s.segments && s.segments.length > 0 && { keep_segments: s.segments }),
+    hook: s.hook ?? null,
+  };
+}
+
+type RecordedDecisions = Parameters<EpisodeState["record"]>[1];
+
+const fileInfoSchema = z.looseObject({
+  filename: z.string().optional(),
+  name: z.string().optional(),
+  path: z.string().optional(),
+  size_mb: z.number().optional(),
+  duration: z.number().optional(),
+});
+
+const presetResultSchema = z.looseObject({
+  error: z.string().optional(),
+  presets: z.array(z.union([z.string(), z.looseObject({ name: z.string().optional() })])).optional(),
+  preset: z.unknown().optional(),
+  config: z
+    .looseObject({
+      caption_style: z.string().optional(),
+      crop_strategy: z.string().optional(),
+      logo_path: z.string().optional(),
+      outro_path: z.string().optional(),
+    })
+    .optional(),
+});
+
+const importTranscriptResultSchema = z.looseObject({
+  error: z.string().optional(),
+  data: z
+    .looseObject({
+      transcript: z.string().optional(),
+      words: z.array(z.unknown()).optional(),
+      segments: z.array(z.unknown()).optional(),
+      duration: z.number().optional(),
+    })
+    .optional(),
+});
+
+const clipEditResultSchema = z.looseObject({
+  error: z.string().optional(),
+  index: z.number().default(0),
+  total: z.number().default(0),
+  selectedCount: z.number().default(0),
+  clip: z.looseObject({
+    title: z.string().default(""),
+    start_second: z.number().optional(),
+    end_second: z.number().optional(),
+    duration: z.number().optional(),
+    hook: z
+      .looseObject({ mode: z.string(), start: z.number(), end: z.number() })
+      .optional(),
+  }).default({ title: "" }),
+});
+
+interface SuggestionsModifyBody {
+  action: string;
+  updates?: object;
+  selected?: boolean;
+  index?: number;
+  clip_id?: string;
+}
+
+/**
+ * Read session state straight off disk (paths.uiState) instead of the Web
+ * UI's HTTP API. Used when the Web UI isn't running. The state file is the
+ * same JSON the UI persists on every change, so the agent isn't blind just
+ * because nothing is listening on webServerUrl.
+ */
+function readUIStateFromDisk(): ServerUIState | null {
+  try {
+    if (!existsSync(paths.uiState)) return null;
+    const raw = readUIStateFile();
+    const words = raw.transcript?.words;
+
+    return {
+      ...raw,
+      transcriptWordCount: Array.isArray(words) ? words.length : 0,
+    };
+  } catch (err) {
+    log.debug("readUIStateFromDisk failed", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+
+    return null;
+  }
+}
+
+async function readUIState(): Promise<ServerUIState | null> {
+  try {
+    const res = await fetch(`${webServerUrl}/api/ui-state`);
+
+    if (!res.ok) return readUIStateFromDisk();
+
+    // SAFETY: /api/ui-state responds with the studio's UIState plus transcriptWordCount.
+    return (await res.json()) as ServerUIState;
+  } catch (err) {
+    log.debug("readUIState via Web UI failed, falling back to disk", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+
+    return readUIStateFromDisk();
+  }
+}
+
+/**
+ * Resolve the path episode decisions should be keyed on. A silence-removal
+ * pass rewrites the working video to a new path with a different size, which
+ * would otherwise orphan decisions already recorded against the original.
+ * When videoPath is the UI's current (derivative) video and a silenceOriginal
+ * is on record, key on the original instead so decisions carry over.
+ */
+async function resolveEpisodeKeyPath(videoPath: string): Promise<string> {
+  const state = await readUIState();
+  const original = state?.silenceOriginal?.videoPath;
+
+  if (original && (state?.videoPath === videoPath || state?.filePath === videoPath)) {
+    return original;
+  }
+
+  return videoPath;
+}
+
+/** Generate workflow guidance based on current state. */
+async function getWorkflowGuidance(): Promise<string> {
+  const state = await readUIState();
+
+  if (!state) {
+    return (
+      "Start from scratch with this workflow:\n" +
+      "1. Set the video: use set_video or transcribe_podcast with a file path\n" +
+      "2. Get a transcript: use transcribe_podcast (auto) or import_transcript / parse_transcript\n" +
+      "3. Read the transcript: use get_ui_state(include_transcript: true)\n" +
+      "4. Suggest clips: analyze the transcript yourself, then call suggest_clips with your picks.\n" +
+      "   Each pick needs a payoff and a standalone check, and an answer needs its question.\n" +
+      "5. Export: use batch_create_clips(export_selected: true) or create_clip(clip_number: N)\n\n" +
+      `Note: The Web UI is not running. Start it with: ${studioStartCommand()}`
+    );
+  }
+
+  const phase = state.phase ?? "idle";
+  const hasVideo = !!(state.videoPath || state.filePath);
+  const wordCount = state.transcriptWordCount ?? 0;
+  const hasTranscript = wordCount > 0;
+  const rawText = state.rawTranscriptText ?? "";
+  const hasRawTranscript = rawText.length > 0;
+  const suggestions = state.suggestions ?? [];
+  const deselected = state.deselectedIndices ?? [];
+  const selectedCount = suggestions.length - deselected.length;
+
+  const lines: string[] = [];
+
+  if (!hasVideo) {
+    lines.push(
+      "NEXT: No video loaded yet. To begin:\n" +
+        '  → Use transcribe_podcast(file_path: "/path/to/episode.mp4") to transcribe and set the video in one step\n' +
+        "  → Or use set_video(file_path: ...) if you'll import a transcript separately",
+    );
+  } else if (!hasTranscript && !hasRawTranscript) {
+    lines.push(
+      `NEXT: Video is loaded but no transcript yet.\n` +
+        `  → Use transcribe_podcast(file_path: "${state.videoPath}") to auto-transcribe with Whisper\n` +
+        `  → Or the user can paste a transcript in the Web UI and you can read it with get_ui_state(include_transcript: true)`,
+    );
+  } else if (hasRawTranscript && !hasTranscript) {
+    lines.push(
+      "NEXT: Raw transcript text is available but not yet parsed.\n" +
+        "  → Use get_ui_state(include_transcript: true) to read the raw text\n" +
+        "  → Then use parse_transcript to get word-level timestamps\n" +
+        "  → Or analyze the text directly and call suggest_clips with your findings",
+    );
+  } else if (hasTranscript && suggestions.length === 0) {
+    lines.push(
+      `NEXT: Transcript is ready (${wordCount} words). Time to find viral moments!\n` +
+        "  → Use get_ui_state(include_transcript: true) to read the full transcript\n" +
+        "  → Analyze it for the most engaging, viral-worthy moments\n" +
+        "  → For each one: pull the question in if it is an answer, then state the payoff before the title\n" +
+        "  → Then call suggest_clips with your suggestions (title, start_second, end_second, payoff, standalone, reasoning)",
+    );
+  } else if (phase === "review" && selectedCount > 0) {
+    lines.push(
+      `NEXT: ${selectedCount} clips are ready for export!\n` +
+        "  → Use batch_create_clips(export_selected: true) to export all selected clips at once\n" +
+        "  → Or use create_clip(clip_number: N) to export a specific one\n" +
+        "  → Use modify_clip to adjust timing or titles before export\n" +
+        "  → Use toggle_clip to select/deselect clips",
+    );
+  } else if (phase === "done" || (phase === "idle" && suggestions.length > 0)) {
+    lines.push(
+      "DONE: Clips have been exported!\n" +
+        "  → Use list_outputs to see all rendered clips\n" +
+        "  → Use get_ui_state(include_transcript: true) to find more moments\n" +
+        "  → Try different caption styles (hormozi, karaoke, subtle, branded) for variety",
+    );
+  }
+
+  const videoPath = state.videoPath || state.filePath;
+
+  if (videoPath) {
+    // A silence-removal pass rewrites the video to a new path with a different
+    // size, which would otherwise orphan decisions already recorded against the
+    // original. Key on the original so they carry over to its derivative.
+    const episodeKeyPath = state.silenceOriginal?.videoPath ?? videoPath;
+    const openQuestions = await episodeState.openQuestions(episodeKeyPath).catch(() => []);
+
+    if (openQuestions.length > 0) {
+      lines.push(
+        "\nOPEN QUESTIONS for this episode. Ask once, then call record_decisions so these never come up again:\n" +
+          openQuestions.map((q) => `  → ${q.question}`).join("\n"),
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+export function createServer(): McpServer {
+  const server = new McpServer({
+    name: "podcli",
+    version: podcliVersion(),
+  });
+
+  // =============================================
+  // Tool: transcribe_podcast
+  // =============================================
+  server.tool(
+    transcribeToolDef.name,
+    transcribeToolDef.description,
+    {
+      file_path: z.string().describe("Absolute path to the podcast file"),
+      model_size: z
+        .enum(["tiny", "base", "small", "medium", "large"])
+        .optional()
+        .default("small")
+        .describe("Whisper model size"),
+      engine: z
+        .enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"])
+        .optional()
+        .describe("Transcription engine"),
+      language: z.string().optional().describe("ISO language code"),
+      enable_diarization: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "Speaker labels (who is speaking). On by default: without them a clip cannot tell a question " +
+            "from an answer. Set false only for a single-speaker recording. Falls back to no labels with " +
+            "a warning where torch is unavailable.",
+        ),
+      num_speakers: z
+        .number()
+        .optional()
+        .describe(
+          "Exact number of speakers if known (e.g. 2). Auto-detects if omitted.",
+        ),
+      start_seconds: z
+        .number()
+        .optional()
+        .describe(
+          "Sample mode: only transcribe a window starting here (seconds into the source), " +
+            "instead of the whole file, e.g. to test a language on 40s before committing to " +
+            "a full run. Pair with duration_seconds. Not written to the main transcript cache.",
+        ),
+      duration_seconds: z
+        .number()
+        .optional()
+        .describe("Sample mode window length in seconds. Defaults start_seconds to 0 if omitted."),
+    },
+    async ({
+      file_path,
+      model_size,
+      engine,
+      language,
+      enable_diarization,
+      num_speakers,
+      start_seconds,
+      duration_seconds,
+    }) => {
+      try {
+        const result = await handleTranscribe({
+          file_path,
+          model_size,
+          engine,
+          language,
+          enable_diarization,
+          num_speakers,
+          start_seconds,
+          duration_seconds,
+        });
+
+        // Push FULL transcript (words[] + segments[]) to Web UI state from the
+        // on-disk cache: NOT the trimmed MCP response. Without words in UI
+        // state, downstream batch_create_clips can't burn captions.
+        // Skipped for a sample: it's never written to this cache, and it's a
+        // slice of the file, not something that belongs in the UI session.
+        const isSample = start_seconds !== undefined || duration_seconds !== undefined;
+
+        try {
+          // handleTranscribe's result carries the engine it actually resolved
+          // to and cached under; the request-time `engine` can be unset while
+          // the write landed under "whispercpp", so reading with it misses.
+          const resolvedEngine =
+            resultEngineSchema.safeParse(JSON.parse(result)).data?.engine ?? engine;
+
+          const cached = isSample
+            ? null
+            : await transcriptCache.get(file_path, {
+                engine: resolvedEngine,
+                model: model_size,
+                language,
+              });
+
+          if (cached) {
+            await uiPing({
+              videoPath: file_path,
+              filePath: file_path,
+              transcript: cached,
+              phase: "idle",
+            });
+          }
+        } catch (err) {
+          log.warn("Failed to push full transcript to UI state", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        const text = withNextStep(
+          await withKnowledge(result),
+          "Transcript is ready! Now read it with get_ui_state(include_transcript: true), " +
+            "analyze it for viral moments, then call suggest_clips with your findings.",
+        );
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: transcribe_start (async)
+  // =============================================
+  server.tool(
+    transcribeStartToolDef.name,
+    transcribeStartToolDef.description,
+    {
+      file_path: z.string(),
+      model_size: z
+        .enum(["tiny", "base", "small", "medium", "large"])
+        .optional()
+        .default("small"),
+      language: z.string().optional(),
+      engine: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).optional(),
+      enable_diarization: z.boolean().optional().default(true),
+      num_speakers: z.number().optional(),
+    },
+    async (input) => {
+      try {
+        const text = await handleTranscribeStart(input);
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: job_status (generic poll: transcribe, render, batch, process_episode)
+  // =============================================
+  server.tool(
+    jobStatusToolDef.name,
+    jobStatusToolDef.description,
+    {
+      job_id: z.string(),
+      wait_seconds: z.number().min(0).max(60).optional().default(30),
+    },
+    async (input) => {
+      try {
+        const text = await handleJobStatus(input);
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: process_episode
+  // =============================================
+  server.tool(
+    processEpisodeToolDef.name,
+    processEpisodeToolDef.description,
+    {
+      video_path: z.string().describe("Absolute path to the episode video or audio"),
+      transcript: z.string().optional().describe("Existing transcript path (.srt, .vtt, .txt, .json)"),
+      top: z.number().optional().describe("How many clips to export. Default 5."),
+      output: z.string().optional().describe("Output directory"),
+      quality: z.enum(["low", "medium", "high", "max"]).optional(),
+      caption_style: z.enum(["branded", "hormozi", "karaoke", "subtle"]).optional(),
+      crop: z.enum(["center", "face", "speaker", "speaker-hardcut"]).optional(),
+      format: z.enum(FORMATS).optional(),
+      language: z.string().optional(),
+      engine: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).optional(),
+      fast: z.boolean().optional(),
+    },
+    async (input) => {
+      try {
+        const text = await handleProcessEpisode(input);
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: rank_clip_candidates
+  // =============================================
+  server.tool(
+    rankClipCandidatesToolDef.name,
+    rankClipCandidatesToolDef.description,
+    {
+      video_path: z.string().describe("Episode video whose transcript is already cached"),
+      top_n: z.number().min(1).max(40).optional().describe("How many candidates to return. Default 20."),
+    },
+    async (input) => {
+      try {
+        const text = await handleRankClipCandidates(input);
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: suggest_clips
+  // =============================================
+  server.tool(
+    suggestClipsToolDef.name,
+    suggestClipsToolDef.description,
+    suggestClipsInputFields,
+    async ({ suggestions }) => {
+      try {
+        const result = await handleSuggestClips({ suggestions });
+
+        // Push enriched suggestions (with clip_ids) to Web UI
+        try {
+          const parsed = JSON.parse(result);
+          await uiPing({ suggestions: parsed.clips, phase: "review" });
+        } catch (err) {
+          log.warn("Failed to parse suggestions for UI push", {
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // Include clip history so Claude avoids duplicates
+        const existing = await history.list(20);
+        let text = await withKnowledge(result);
+
+        if (existing.length > 0) {
+          const summary = existing
+            .map(
+              (e) =>
+                `  - "${e.title}" ${e.start_second}s-${e.end_second}s (${e.caption_style})`,
+            )
+            .join("\n");
+
+          text += `\n\n[Previously Created Clips (avoid duplicates)]\n${summary}`;
+        }
+
+        const parsed2 = JSON.parse(result);
+        const clipCount = parsed2.clip_count || 0;
+        text = withNextStep(
+          text,
+          `${clipCount} clips suggested and sent to the UI! The user can review them in the Web UI.\n` +
+            "  → To export all at once: batch_create_clips(export_selected: true)\n" +
+            "  → To export specific ones: create_clip(clip_number: 1) or batch_create_clips(clip_numbers: [1, 3, 5])\n" +
+            "  → To adjust: modify_clip(clip_number: N, updates: {start_second: ..., end_second: ...})\n" +
+            "  → To remove one: toggle_clip(clip_number: N, selected: false)",
+        );
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: create_clip
+  // =============================================
+  server.tool(
+    createClipToolDef.name,
+    createClipToolDef.description,
+    {
+      clip_number: z
+        .number()
+        .optional()
+        .describe(
+          "Export a suggested clip by its number (from suggest_clips). Auto-fills video_path, start/end times, title, and transcript_words from session state.",
+        ),
+      video_path: z
+        .string()
+        .optional()
+        .describe(
+          "Path to the original podcast video. Auto-loaded from session state if clip_number is provided.",
+        ),
+      start_second: z
+        .number()
+        .optional()
+        .describe(
+          "Clip start time in seconds. Auto-loaded from clip_number if omitted.",
+        ),
+      end_second: z
+        .number()
+        .optional()
+        .describe(
+          "Clip end time in seconds. Auto-loaded from clip_number if omitted.",
+        ),
+      caption_style: z
+        .enum(["hormozi", "karaoke", "subtle", "branded"])
+        .optional()
+        .default("hormozi")
+        .describe("Caption style"),
+      crop_strategy: z
+        .enum(["center", "face", "speaker"])
+        .optional()
+        .default("speaker")
+        .describe("Cropping strategy"),
+      format: z
+        .enum(FORMATS)
+        .optional()
+        .default("vertical")
+        .describe(
+          "Output aspect ratio (vertical=9:16, horizontal=16:9 up to 5 minutes, square=1:1, topic=16:9 segments of 5-15 minutes)",
+        ),
+      allow_ass_fallback: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Allow ASS caption fallback if Remotion rendering fails (default: false)",
+        ),
+      clean_fillers: z
+        .boolean()
+        .optional()
+        .describe(
+          "Remove filler words (um, uh, hmm) from captions and compress long silences. Defaults to the studio's clean filler words setting (on unless the user turned it off).",
+        ),
+      transcript_words: z
+        .array(
+          z.object({
+            word: z.string(),
+            start: z.number(),
+            end: z.number(),
+            confidence: z.number().optional().default(0),
+          }),
+        )
+        .optional()
+        .describe(
+          "Word-level timestamps. Auto-loaded from session state if omitted.",
+        ),
+      title: z.string().optional().default("clip").describe("Clip title"),
+      logo_path: z
+        .string()
+        .optional()
+        .describe(
+          "Path or registered asset name for PNG logo. Shown in top-left (branded style).",
+        ),
+      outro_path: z
+        .string()
+        .optional()
+        .describe("Path to an outro video to append at the end of the clip"),
+      keep_caption_overlay: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Keep ProRes 4444 alpha caption overlay beside the render (for DaVinci Resolve export). Returns caption_overlay_path and cropped_source_path.",
+        ),
+      write_clean_variant: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Also render a second file with the same audio, loudness, and intro/outro but no burned captions. Returns clean_output_path.",
+        ),
+      hook: hookSchema
+        .nullable()
+        .optional()
+        .describe(
+          "Opening hook for this render. Auto-loaded from clip_number if omitted; null renders without one.",
+        ),
+    },
+    async (params) => {
+      try {
+        // Resolve asset names to paths
+        if (params.logo_path) {
+          const resolved = await assets.resolve(params.logo_path);
+
+          if (resolved) params.logo_path = resolved;
+        }
+
+        // Resolve clip_number from UI state BEFORE routing
+        let keepSegments: Array<{ start: number; end: number }> | null = null;
+        let hook: ClipHook | null = params.hook ?? null;
+
+        if (
+          params.clip_number != null &&
+          (params.start_second == null || params.end_second == null)
+        ) {
+          const uiState = await readUIState();
+          const suggestions = uiState?.suggestions ?? [];
+          const settings = uiState?.settings ?? {};
+          const idx = params.clip_number - 1;
+
+          if (idx < 0 || idx >= suggestions.length) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Clip #${params.clip_number} not found. Available: 1-${suggestions.length}`,
+                },
+              ],
+            };
+          }
+
+          const suggestion = suggestions[idx];
+
+          if (params.start_second == null)
+            params.start_second = suggestion.start_second;
+
+          if (params.end_second == null)
+            params.end_second = suggestion.end_second;
+
+          if (!params.video_path)
+            params.video_path = uiState?.videoPath || uiState?.filePath || "";
+
+          if (!params.title || params.title === "clip")
+            params.title = suggestion.title || "clip";
+
+          if (!params.caption_style || params.caption_style === "hormozi") {
+            const style = suggestion.suggested_caption_style || settings.captionStyle;
+            const parsedStyle = captionStyleSchema.safeParse(style);
+
+            params.caption_style = parsedStyle.success ? parsedStyle.data : "hormozi";
+          }
+
+          if (!params.transcript_words) {
+            const transcript = uiState?.transcript;
+
+            if (transcript?.words) {
+              // handleCreateClip only runs this guard when transcript_words
+              // arrives null, so filling it from state here has to run the
+              // check itself or an offline render against a swapped video
+              // would silently skip it.
+              const mismatch = transcriptVideoMismatch(
+                uiState?.transcriptVideoIdentity,
+                params.video_path ?? "",
+              );
+
+              if (mismatch) {
+                return { content: [{ type: "text" as const, text: mismatch }], isError: true };
+              }
+
+              params.transcript_words = transcript.words;
+            }
+          }
+
+          // Pull multi-cut segments from suggestion
+          const segs = suggestion.segments;
+
+          if (segs && segs.length > 0) {
+            keepSegments = segs;
+          }
+
+          if (params.hook === undefined && suggestion.hook) hook = suggestion.hook;
+        }
+
+        const videoPath = params.video_path;
+        const startSecond = params.start_second;
+        const endSecond = params.end_second;
+
+        if (!videoPath || startSecond === undefined || endSecond === undefined) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "create_clip needs video_path, start_second, and end_second, or a clip_number from the current suggestions.",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Check for duplicates
+        const dup = await history.findDuplicate(
+          videoPath,
+          startSecond,
+          endSecond,
+          params.caption_style,
+          params.crop_strategy,
+          params.format,
+        );
+
+        if (dup) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Duplicate found! This clip was already created on ${dup.created_at}.\nOutput: ${dup.output_path}\nUse a different time range or style to create a new clip.`,
+              },
+            ],
+          };
+        }
+
+        // Route through web server for real-time UI progress tracking
+        let usedWebServer = false;
+        let finalResult = "";
+
+        try {
+          const webRes = await fetch(`${webServerUrl}/api/mcp/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              video_path: params.video_path,
+              clips: [
+                {
+                  start_second: params.start_second,
+                  end_second: params.end_second,
+                  title: params.title,
+                  caption_style: params.caption_style || "hormozi",
+                  crop_strategy: params.crop_strategy || "speaker",
+                  format: params.format || "vertical",
+                  allow_ass_fallback: params.allow_ass_fallback === true,
+                  keep_caption_overlay: params.keep_caption_overlay === true,
+                  write_clean_variant: params.write_clean_variant === true,
+                  ...(keepSegments && { segments: keepSegments }),
+                  hook,
+                },
+              ],
+              transcript_words: params.transcript_words,
+              logo_path: params.logo_path || null,
+              outro_path: params.outro_path || null,
+              ...(params.clean_fillers !== undefined && {
+                clean_fillers: params.clean_fillers,
+              }),
+              keep_caption_overlay: params.keep_caption_overlay === true,
+              write_clean_variant: params.write_clean_variant === true,
+            }),
+          });
+
+          if (webRes.ok) {
+            const webData = webJobSchema.parse(await webRes.json());
+            const jobId = webData.job_id;
+
+            // Poll the job until completion (1 hour max)
+            const deadline = Date.now() + 3600_000;
+            let lostJob = false;
+
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 2000));
+
+              const pollRes = await fetch(
+                `${webServerUrl}/api/job/${jobId}`,
+              );
+
+              if (!pollRes.ok) {
+                lostJob = true;
+                break;
+              }
+
+              const job = webJobSchema.parse(await pollRes.json());
+
+              if (job.status === "done") {
+                usedWebServer = true;
+                finalResult = JSON.stringify(job.result, null, 2);
+                break;
+              }
+
+              if (job.status === "error") {
+                throw new Error(job.error || "Job failed");
+              }
+            }
+
+            if (!usedWebServer) {
+              throw new Error(
+                lostJob
+                  ? `Lost track of render job ${jobId}: the web server stopped reporting it (it may have restarted). Check list_outputs for results.`
+                  : "Clip creation timed out after 1 hour",
+              );
+            }
+          }
+        } catch (webErr: unknown) {
+          if (!studioUnreachable(webErr instanceof Error ? webErr.message : String(webErr), "create_clip")) throw webErr;
+        }
+
+        if (!usedWebServer) {
+          // Notify UI that export is starting
+          await uiPing({ phase: "exporting" });
+
+          finalResult = await handleCreateClip({ ...params, hook });
+          const parsed = JSON.parse(finalResult);
+
+          // Record to history
+          const rec = await history.record({
+            source_video: videoPath,
+            start_second: startSecond,
+            end_second: endSecond,
+            caption_style: params.caption_style,
+            crop_strategy: params.crop_strategy,
+            format: params.format,
+            logo_path: params.logo_path,
+            title: params.title,
+            output_path: parsed.output_path,
+            file_size_mb: parsed.file_size_mb,
+            duration: parsed.duration,
+            content_type: parsed.content_type,
+            transcript_slice: parsed.transcript_slice,
+            payoff: parsed.payoff,
+            context_line: parsed.context_line,
+            preview_text: parsed.preview_text,
+          });
+
+          const uiStateForRecipe = await readUIState().catch(() => null);
+          const recipeSettings = uiStateForRecipe?.settings ?? {};
+          await history.persistClipRecipe(rec, {
+            transcriptWords: params.transcript_words,
+            logoPath: params.logo_path || recipeSettings.logoPath || null,
+            outroPath: params.outro_path || recipeSettings.outroPath || null,
+            introPath: recipeSettings.introPath || null,
+            cleanFillers: params.clean_fillers ?? recipeSettings.cleanFillers ?? true,
+            keepSegments: keepSegments ?? undefined,
+            hook,
+          });
+
+          // Notify UI that export is done
+          await uiPing({ phase: "done" });
+        }
+
+        const clipText = withNextStep(
+          finalResult,
+          "Clip exported to data/output/! You can:\n" +
+            "  → Export more: create_clip(clip_number: N) or batch_create_clips(export_selected: true)\n" +
+            "  → List all outputs: list_outputs\n" +
+            '  → Try a different style: create_clip(clip_number: N, caption_style: "karaoke")',
+        );
+
+        return { content: [{ type: "text" as const, text: clipText }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: batch_create_clips
+  // =============================================
+  server.tool(
+    batchClipsToolDef.name,
+    batchClipsToolDef.description,
+    {
+      video_path: z
+        .string()
+        .optional()
+        .describe(
+          "Path to the original podcast video. Auto-loaded from session state if omitted.",
+        ),
+      clips: z
+        .array(
+          z.object({
+            start_second: z.number(),
+            end_second: z.number(),
+            title: z.string().optional(),
+            caption_style: z
+              .enum(["hormozi", "karaoke", "subtle", "branded"])
+              .optional(),
+            crop_strategy: z.enum(["center", "face", "speaker"]).optional(),
+            format: z.enum(FORMATS).optional(),
+            allow_ass_fallback: z.boolean().optional(),
+            keep_caption_overlay: z.boolean().optional(),
+            write_clean_variant: z.boolean().optional(),
+            hook: hookSchema.nullable().optional(),
+          }),
+        )
+        .optional()
+        .describe(
+          "Array of clips to create. Auto-loaded from suggestions if omitted.",
+        ),
+      write_clean_variant: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also render a clean (no burned captions) variant per clip, batch-level default; per-clip overrides. Returns clean_output_path.",
+        ),
+      keep_caption_overlay: z
+        .boolean()
+        .optional()
+        .describe(
+          "Keep ProRes 4444 alpha caption overlays for DaVinci Resolve export (batch-level default; per-clip overrides).",
+        ),
+      clean_fillers: z
+        .boolean()
+        .optional()
+        .describe(
+          "Remove filler words (um, uh, hmm) from captions and compress long silences. Defaults to the studio's clean filler words setting (on unless the user turned it off).",
+        ),
+      transcript_words: z
+        .array(
+          z.object({
+            word: z.string(),
+            start: z.number(),
+            end: z.number(),
+            confidence: z.number().optional().default(0),
+          }),
+        )
+        .optional()
+        .describe(
+          "Word-level timestamps. Auto-loaded from session state if omitted.",
+        ),
+      export_selected: z
+        .boolean()
+        .optional()
+        .describe("If true, export all selected suggestions from the UI."),
+      clip_numbers: z
+        .array(z.number())
+        .optional()
+        .describe(
+          "Export specific clip numbers from suggestions (e.g. [1, 3, 5]).",
+        ),
+      async_mode: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Return a job_id immediately and render in background. Use for multi-clip batches " +
+            "so Claude can poll job_status and emit live progress. Requires Web UI running.",
+        ),
+    },
+    async (params) => {
+      try {
+        // Resolve clip_numbers/export_selected from UI state BEFORE routing
+        let resolvedClips = params.clips;
+        let resolvedVideoPath = params.video_path;
+        let resolvedTranscriptWords = params.transcript_words;
+
+        if (!resolvedClips && (params.export_selected || params.clip_numbers)) {
+          const uiState = await readUIState();
+          const suggestions = uiState?.suggestions ?? [];
+          const settings = uiState?.settings ?? {};
+          const deselected = uiState?.deselectedIndices ?? [];
+
+          if (!resolvedVideoPath)
+            resolvedVideoPath = uiState?.videoPath || uiState?.filePath || "";
+
+          if (!resolvedTranscriptWords) {
+            const transcript = uiState?.transcript;
+
+            if (transcript?.words) {
+              // handleBatchClips only runs this guard when transcript_words
+              // arrives null, so filling it from state here has to run the
+              // check itself or an offline render against a swapped video
+              // would silently skip it.
+              const mismatch = transcriptVideoMismatch(
+                uiState?.transcriptVideoIdentity,
+                resolvedVideoPath,
+              );
+
+              if (mismatch) {
+                return { content: [{ type: "text" as const, text: mismatch }], isError: true };
+              }
+
+              resolvedTranscriptWords = transcript.words;
+            }
+          }
+
+          if (params.export_selected) {
+            resolvedClips = suggestions
+              .filter((_, i) => !deselected.includes(i))
+              .map((s, i) => exportClipFromSuggestion(s, `clip_${i + 1}`, settings));
+          } else if (params.clip_numbers) {
+            resolvedClips = params.clip_numbers
+              .filter((n) => n >= 1 && n <= suggestions.length)
+              .map((n) => exportClipFromSuggestion(suggestions[n - 1], `clip_${n}`, settings));
+          }
+        }
+
+        // Try routing through web server for real-time UI progress
+        // The web server handles SSE broadcasts (export-started, job-update, job-complete)
+        let usedWebServer = false;
+        let finalResult: string = "";
+
+        try {
+          const webRes = await fetch(`${webServerUrl}/api/mcp/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              video_path: resolvedVideoPath,
+              clips: resolvedClips,
+              transcript_words: resolvedTranscriptWords,
+              ...(params.clean_fillers !== undefined && {
+                clean_fillers: params.clean_fillers,
+              }),
+              keep_caption_overlay: params.keep_caption_overlay === true,
+              write_clean_variant: params.write_clean_variant === true,
+            }),
+          });
+
+          if (webRes.ok) {
+            const webData = webJobSchema.parse(await webRes.json());
+            const jobId = webData.job_id;
+
+            // async_mode: return job_id immediately so the caller can narrate
+            // progress by polling job_status between outputs.
+            if (params.async_mode) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify({
+                      job_id: jobId,
+                      status: "running",
+                      clip_count: (resolvedClips || []).length,
+                      next_step: `Poll job_status("${jobId}", wait_seconds: 30) in a loop, emitting one terse progress line per poll (e.g. "Rendering 3/7, clip #3"). Stop when done=true.`,
+                    }),
+                  },
+                ],
+              };
+            }
+
+            // Sync path: poll internally until completion (1 hour max)
+            const deadline = Date.now() + 3600_000;
+            let lostJob = false;
+
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 2000));
+
+              const pollRes = await fetch(
+                `${webServerUrl}/api/job/${jobId}`,
+              );
+
+              if (!pollRes.ok) {
+                lostJob = true;
+                break;
+              }
+
+              const job = webJobSchema.parse(await pollRes.json());
+
+              if (job.status === "done") {
+                usedWebServer = true;
+                finalResult = JSON.stringify(job.result, null, 2);
+                break;
+              }
+
+              if (job.status === "error") {
+                throw new Error(job.error || "Job failed");
+              }
+            }
+
+            if (!usedWebServer) {
+              throw new Error(
+                lostJob
+                  ? `Lost track of batch job ${jobId}: the web server stopped reporting it (it may have restarted). Check list_outputs for partial results.`
+                  : "Batch clip creation timed out after 1 hour",
+              );
+            }
+          }
+        } catch (webErr: unknown) {
+          if (!studioUnreachable(webErr instanceof Error ? webErr.message : String(webErr), "batch_create_clips")) throw webErr;
+        }
+
+        if (!usedWebServer) {
+          await uiPing({ phase: "exporting" });
+
+          // handleBatchClips records history + recipes itself.
+          finalResult = await handleBatchClips({
+            ...params,
+            video_path: resolvedVideoPath || params.video_path,
+            clips: resolvedClips || params.clips,
+            transcript_words: resolvedTranscriptWords || params.transcript_words,
+          });
+
+          await uiPing({ phase: "done" });
+        }
+
+        const batchText = withNextStep(
+          finalResult,
+          "Batch export complete! Clips are in data/output/. You can:\n" +
+            "  → Use list_outputs to see all rendered clips with file sizes\n" +
+            "  → Find more moments: get_ui_state(include_transcript: true) and suggest_clips again\n" +
+            "  → Re-export with different styles: update_settings then batch_create_clips(export_selected: true)",
+        );
+
+        return { content: [{ type: "text" as const, text: batchText }] };
+      } catch (err: unknown) {
+        // Notify UI of error
+        await uiPing({ phase: "review" });
+        log.error("batch_create_clips failed", {
+          err: err instanceof Error ? err.stack : String(err),
+        });
+        const msg = err instanceof Error ? err.message : String(err);
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: knowledge_base
+  // =============================================
+  server.tool(
+    "knowledge_base",
+    "Read or manage the podcli knowledge base. These are .md files that provide context about the podcast (hosts, style, audience, etc). Always read the knowledge base before suggesting or creating clips.",
+    {
+      action: z
+        .enum(["read_all", "list", "read", "write", "delete"])
+        .describe("Action to perform"),
+      filename: z
+        .string()
+        .optional()
+        .describe("Filename for read/write/delete (e.g. 'style.md')"),
+      content: z
+        .string()
+        .optional()
+        .describe("Markdown content for write action"),
+    },
+    async ({ action, filename, content }) => {
+      try {
+        if (action === "read_all" || action === "list") {
+          const files = await kb.listFiles();
+
+          if (files.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Knowledge base is empty. Add .md files to .podcli/knowledge/ in the project directory.",
+                },
+              ],
+            };
+          }
+
+          const summaries: string[] = [];
+
+          for (const f of files) {
+            let preview = "";
+
+            try {
+              const content = await kb.readFile(f.filename);
+
+              // First non-empty, non-heading line as preview
+              const lines = content
+                .split("\n")
+                .filter((l: string) => l.trim() && !l.startsWith("#"));
+
+              preview = lines[0]?.trim().slice(0, 100) || "";
+            } catch (err) {
+              log.debug("Failed to read KB file for preview", {
+                file: f.filename,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+
+            summaries.push(
+              `- ${f.filename} (updated ${f.updatedAt})${preview ? `\n  ${preview}` : ""}`,
+            );
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Knowledge base (${files.length} files). Use the read action with filename to get full content:\n${summaries.join("\n")}`,
+              },
+            ],
+          };
+        }
+
+        if (action === "read" && filename) {
+          const text = await kb.readFile(filename);
+
+          return { content: [{ type: "text" as const, text }] };
+        }
+
+        if (action === "write" && filename && content) {
+          await kb.writeFile(filename, content);
+
+          return {
+            content: [{ type: "text" as const, text: `Saved ${filename}` }],
+          };
+        }
+
+        if (action === "delete" && filename) {
+          await kb.deleteFile(filename);
+
+          return {
+            content: [{ type: "text" as const, text: `Deleted ${filename}` }],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Invalid action or missing parameters.",
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: manage_assets
+  // =============================================
+  server.tool(
+    "manage_assets",
+    "Register and manage reusable assets (logos, outros, intros, music, images). Reference them by name in create_clip/manage_reel instead of full paths. One logo/outro/intro/music can be the default, applied automatically when none is passed.",
+    {
+      action: z
+        .enum([
+          "list",
+          "register",
+          "import",
+          "import_url",
+          "unregister",
+          "resolve",
+          "set_default",
+          "clear_default",
+          "rename",
+        ])
+        .describe("Action to perform"),
+      name: z.string().optional().describe("Asset name (e.g. 'podcast-logo')"),
+      new_name: z.string().optional().describe("New asset name (for rename)"),
+      path: z.string().optional().describe("Absolute file path (for register/import)"),
+      url: z.string().optional().describe("Remote URL to download (for import_url)"),
+      type: z
+        .enum(["logo", "outro", "intro", "music", "image", "audio", "other"])
+        .optional()
+        .describe("Asset type (for register/import/list filter)"),
+    },
+    async ({ action, name, new_name, path, url, type }) => {
+      try {
+        if (action === "list") {
+          const items = await assets.list(type || undefined);
+
+          if (items.length === 0)
+            return {
+              content: [
+                { type: "text" as const, text: "No assets registered." },
+              ],
+            };
+
+          const text = items
+            .map((a) => `- ${a.name} (${a.type})${a.default ? " [default]" : ""}: ${a.path}`)
+            .join("\n");
+
+          return { content: [{ type: "text" as const, text }] };
+        }
+
+        if (action === "register" && name && path) {
+          const asset = await assets.register(name, path, type || inferType(path));
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Registered "${asset.name}" → ${asset.path}`,
+              },
+            ],
+          };
+        }
+
+        if (action === "import" && path && name) {
+          const asset = await assets.importFile(path, name, type || inferType(path));
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Imported "${asset.name}" → ${asset.path}`,
+              },
+            ],
+          };
+        }
+
+        if (action === "import_url" && url && name) {
+          const asset = await assets.importUrl(url, name, type);
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Imported "${asset.name}" from URL → ${asset.path}`,
+              },
+            ],
+          };
+        }
+
+        if (action === "unregister" && name) {
+          await assets.unregister(name);
+
+          return {
+            content: [
+              { type: "text" as const, text: `Unregistered "${name}"` },
+            ],
+          };
+        }
+
+        if (action === "resolve" && name) {
+          const resolved = await assets.resolve(name);
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: resolved || `Asset "${name}" not found.`,
+              },
+            ],
+          };
+        }
+
+        if (action === "set_default" && name) {
+          const asset = await assets.setDefault(name);
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `"${asset.name}" is now the default ${asset.type}.`,
+              },
+            ],
+          };
+        }
+
+        if (action === "clear_default" && name) {
+          await assets.clearDefault(name);
+
+          return {
+            content: [
+              { type: "text" as const, text: `"${name}" is no longer a default.` },
+            ],
+          };
+        }
+
+        if (action === "rename" && name && new_name) {
+          const asset = await assets.rename(name, new_name);
+
+          return {
+            content: [
+              { type: "text" as const, text: `Renamed to "${asset.name}".` },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Invalid action or missing parameters.",
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: clip_history
+  // =============================================
+  server.tool(
+    "clip_history",
+    "View previously created clips to avoid duplicates. Check before creating new clips.",
+    {
+      action: z
+        .enum(["list", "check", "delete"])
+        .describe("list = recent clips, check = find duplicate, delete = remove a clip"),
+      clip_id: z
+        .string()
+        .optional()
+        .describe("Clip id, full or 8-char prefix (for delete)"),
+      source_video: z
+        .string()
+        .optional()
+        .describe("Source video path (for check or filter)"),
+      start_second: z.number().optional().describe("Start time (for check)"),
+      end_second: z.number().optional().describe("End time (for check)"),
+      caption_style: z
+        .string()
+        .optional()
+        .describe("Caption style (for check)"),
+      crop_strategy: z
+        .string()
+        .optional()
+        .describe("Crop strategy (for check)"),
+      format: z.enum(FORMATS).optional().describe("Output format (for check)"),
+      limit: z.number().optional().default(20).describe("Max results for list"),
+    },
+    async ({
+      action,
+      clip_id,
+      source_video,
+      start_second,
+      end_second,
+      caption_style,
+      crop_strategy,
+      format,
+      limit,
+    }) => {
+      try {
+        if (action === "delete") {
+          if (!clip_id)
+            return {
+              content: [{ type: "text" as const, text: "Provide clip_id to delete." }],
+            };
+          const removed = await history.remove(clip_id);
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: removed
+                  ? `Deleted "${removed.title}" (${removed.id}).`
+                  : `No clip matched "${clip_id}".`,
+              },
+            ],
+          };
+        }
+
+        if (action === "list") {
+          const entries = source_video
+            ? await history.getBySource(source_video)
+            : await history.list(limit || 20);
+
+          if (entries.length === 0)
+            return {
+              content: [
+                { type: "text" as const, text: "No clips in history." },
+              ],
+            };
+
+          const text = entries
+            .map(
+              (e) =>
+                `- "${e.title}" ${e.start_second}s-${e.end_second}s | ${e.caption_style} | ${e.created_at} | ${e.output_path}`,
+            )
+            .join("\n");
+
+          return { content: [{ type: "text" as const, text }] };
+        }
+
+        if (
+          action === "check" &&
+          source_video &&
+          start_second !== undefined &&
+          end_second !== undefined
+        ) {
+          const dup = await history.findDuplicate(
+            source_video,
+            start_second,
+            end_second,
+            caption_style || "hormozi",
+            crop_strategy || "speaker",
+            format || "vertical",
+          );
+
+          if (dup) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Duplicate found: "${dup.title}" created ${dup.created_at}\nOutput: ${dup.output_path}`,
+                },
+              ],
+            };
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No duplicate found. Safe to create.",
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Invalid action or missing parameters.",
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: get_ui_state
+  // =============================================
+  server.tool(
+    "get_ui_state",
+    "Read the current podcli session state and get guidance on what to do next. " +
+      "Returns: video path, transcript status, clip suggestions, settings, and workflow next steps.\n\n" +
+      "IMPORTANT: Call this FIRST when starting a new conversation to understand the current state.\n" +
+      "Clips are numbered #1, #2, etc. Use these numbers with create_clip(clip_number), " +
+      "batch_create_clips(clip_numbers), modify_clip, and toggle_clip.\n\n" +
+      "Set include_transcript=true to analyze transcript content. Returns a compact phrase-grouped " +
+      "markdown view (~10x smaller than raw segments) with speaker attribution, silence gaps, and " +
+      "optional energy peaks: the primary surface for reasoning about clip boundaries.",
+    {
+      include_transcript: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Include full transcript segments in the response. Set true when analyzing content for clip suggestions.",
+        ),
+    },
+    async ({ include_transcript }) => {
+      try {
+        const state = await readUIState();
+
+        if (!state) {
+          const guidance = await getWorkflowGuidance();
+
+          return { content: [{ type: "text" as const, text: guidance }] };
+        }
+
+        const lines: string[] = [];
+        lines.push(`Phase: ${state.phase}`);
+        lines.push(`Video: ${state.videoPath || state.filePath || "(none)"}`);
+
+        if (state.videoMissing) {
+          lines.push(
+            "WARNING: the video file above was not found on disk at last check (e.g. an external " +
+              "drive may be unmounted). The session (transcript, suggestions) is kept, but create_clip/" +
+              "batch_create_clips will fail until the file is reachable again.",
+          );
+        }
+
+        lines.push(
+          `Settings: caption=${state.settings?.captionStyle}, crop=${state.settings?.cropStrategy}, logo=${state.settings?.logoPath || "none"}`,
+        );
+        lines.push(`Transcript: ${state.transcriptWordCount ?? 0} words`);
+
+        const allSuggestions = state.suggestions ?? [];
+        const deselected = state.deselectedIndices ?? [];
+        const selectedCount = allSuggestions.length - deselected.length;
+        lines.push(
+          `Clips: ${selectedCount} selected, ${allSuggestions.length} total`,
+        );
+
+        if (allSuggestions.length) {
+          lines.push("");
+          lines.push(
+            "Clips (use these numbers with create_clip/batch_create_clips):",
+          );
+
+          for (let i = 0; i < allSuggestions.length; i++) {
+            const clip = allSuggestions[i];
+            const num = i + 1;
+            const title = clip.title || "untitled";
+            const start = clip.start_second ?? "?";
+            const end = clip.end_second ?? "?";
+
+            const duration =
+              clip.start_second !== undefined && clip.end_second !== undefined
+                ? `${Math.round(end - start)}s`
+                : "?";
+
+            const style = clip.suggested_caption_style || "hormozi";
+
+            const tag = deselected.includes(i)
+              ? " [DESELECTED]"
+              : clip.changedSinceSelection
+                ? " [CHANGED SINCE SELECTION, re-confirm before exporting]"
+                : "";
+
+            lines.push(
+              `  #${num}: "${title}" (${start}s-${end}s, ${duration}) [${style}]${tag}`,
+            );
+          }
+        }
+
+        if (include_transcript) {
+          // Prefer packed markdown (10x smaller, phrase-grouped, LLM-readable).
+          // Auto-generated during transcription: see backend/services/transcript_packer.py.
+          let packed: string | null = null;
+
+          if (state.videoPath) {
+            packed = await transcriptCache.getPackedMarkdown(
+              state.videoPath,
+              state.transcript?.engine,
+            );
+          }
+
+          if (!packed && state.rawTranscriptText) {
+            packed = await transcriptCache.getPackedMarkdownFromText(
+              state.rawTranscriptText,
+            );
+          }
+
+          if (packed) {
+            lines.push("");
+            lines.push("=== PACKED TRANSCRIPT ===");
+            lines.push(packed);
+          } else if (state.transcript) {
+            const segments = state.transcript.segments || [];
+
+            if (segments.length) {
+              const segLines: string[] = [];
+
+              for (const seg of segments) {
+                const speaker = seg.speaker || "?";
+                const start = Math.floor(seg.start || 0);
+                const end = Math.floor(seg.end || 0);
+                const text = seg.text || "";
+                segLines.push(`[${start}s-${end}s] ${speaker}: ${text}`);
+              }
+
+              lines.push("");
+              lines.push("=== TRANSCRIPT ===");
+              lines.push(capTranscriptText(segLines.join("\n")));
+            }
+          } else if (state.rawTranscriptText) {
+            lines.push("");
+            lines.push(
+              "=== RAW TRANSCRIPT (not yet parsed: use this to analyze and suggest clips) ===",
+            );
+            lines.push(capTranscriptText(state.rawTranscriptText));
+          }
+        }
+
+        // Append workflow guidance
+        const guidance = await getWorkflowGuidance();
+        lines.push("");
+        lines.push("---");
+        lines.push(guidance);
+
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        return {
+          content: [
+            { type: "text" as const, text: `Error reading UI state: ${msg}` },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: modify_clip
+  // =============================================
+  server.tool(
+    "modify_clip",
+    "Adjust a suggested clip before exporting. Change timing, title, caption style, or opening hook. " +
+      "Use action='delete' to remove a clip entirely. Reference clips by clip_number (from get_ui_state).",
+    {
+      clip_number: z
+        .number()
+        .optional()
+        .describe("Clip number (1-based, from get_ui_state)"),
+      clip_id: z
+        .string()
+        .optional()
+        .describe("UUID of the clip (alternative to clip_number)"),
+      index: z
+        .number()
+        .optional()
+        .describe("0-based index (deprecated, use clip_number)"),
+      action: z
+        .enum(["update", "delete"])
+        .optional()
+        .default("update")
+        .describe("Action: 'update' (default) or 'delete'"),
+      updates: z
+        .object({
+          title: z.string().optional(),
+          start_second: z.number().optional(),
+          end_second: z.number().optional(),
+          payoff: z.string().optional(),
+          standalone: z.string().optional(),
+          context_line: z.string().optional(),
+          reasoning: z.string().optional(),
+          preview_text: z.string().optional(),
+          suggested_caption_style: z
+            .enum(["hormozi", "karaoke", "subtle", "branded"])
+            .optional(),
+          hook: hookSchema
+            .nullable()
+            .optional()
+            .describe("Set the opening hook, or pass null to clear it."),
+        })
+        .optional()
+        .describe(
+          "Partial fields to update on the clip (ignored when action='delete')",
+        ),
+    },
+    async ({ clip_number, clip_id, index, action, updates }) => {
+      try {
+        if (action !== "delete" && Object.keys(updates || {}).length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No updates provided. Specify at least one field: title, start_second, end_second, payoff, standalone, context_line, reasoning, preview_text, suggested_caption_style, or hook.",
+              },
+            ],
+          };
+        }
+
+        // Mutate server-side so concurrent edits aren't lost to a wholesale
+        // state replace (clip_number is 1-based).
+        const body: SuggestionsModifyBody = { action, updates };
+
+        if (clip_number !== undefined) body.index = clip_number - 1;
+        else if (clip_id) body.clip_id = clip_id;
+        else if (index !== undefined) body.index = index;
+
+        const res = await fetch(`${webServerUrl}/api/suggestions/modify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        const data = clipEditResultSchema.parse(await res.json());
+
+        if (!res.ok || data.error) {
+          if (res.status === 404) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Clip not found. Use get_ui_state to see available clips.",
+                },
+              ],
+            };
+          }
+
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+
+        if (action === "delete") {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Deleted clip #${data.index + 1}: "${data.clip.title}". ${data.total} clips remaining.`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Updated clip #${data.index + 1}: "${data.clip.title}" (${data.clip.start_second}s-${data.clip.end_second}s, ${data.clip.duration}s` +
+                (data.clip.hook
+                  ? `, opens with a ${data.clip.hook.mode} hook ${data.clip.hook.start}s-${data.clip.hook.end}s)`
+                  : ")"),
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: toggle_clip
+  // =============================================
+  server.tool(
+    "toggle_clip",
+    "Select or deselect a suggested clip by clip_number. Selected clips are exported with export_selected.",
+    {
+      clip_number: z
+        .number()
+        .optional()
+        .describe("Clip number (1-based, from get_ui_state)"),
+      clip_id: z
+        .string()
+        .optional()
+        .describe("UUID of the clip (alternative to clip_number)"),
+      index: z
+        .number()
+        .optional()
+        .describe("0-based index (deprecated, use clip_number)"),
+      selected: z.boolean().describe("true = select, false = deselect"),
+    },
+    async ({ clip_number, clip_id, index, selected }) => {
+      try {
+        // Mutate server-side so concurrent edits aren't lost to a wholesale
+        // state replace (clip_number is 1-based).
+        const body: SuggestionsModifyBody = { action: "toggle", selected };
+
+        if (clip_number !== undefined) body.index = clip_number - 1;
+        else if (clip_id) body.clip_id = clip_id;
+        else if (index !== undefined) body.index = index;
+
+        const res = await fetch(`${webServerUrl}/api/suggestions/modify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        const data = clipEditResultSchema.parse(await res.json());
+
+        if (!res.ok || data.error) {
+          if (res.status === 404) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Clip not found. Use get_ui_state to see available clips.",
+                },
+              ],
+            };
+          }
+
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Clip #${data.index + 1} "${data.clip.title}" is now ${selected ? "selected" : "deselected"}. (${data.selectedCount}/${data.total} selected)`,
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: update_settings
+  // =============================================
+  server.tool(
+    "update_settings",
+    "Update rendering settings (caption style, crop strategy, logo, outro) in the Web UI.",
+    {
+      caption_style: z
+        .enum(["hormozi", "karaoke", "subtle", "branded"])
+        .optional()
+        .describe("Caption style"),
+      crop_strategy: z
+        .enum(["center", "face", "speaker"])
+        .optional()
+        .describe("Cropping strategy"),
+      logo_path: z
+        .string()
+        .optional()
+        .describe("Path or registered asset name for PNG logo"),
+      outro_path: z
+        .string()
+        .optional()
+        .describe("Path or registered asset name for outro video"),
+      intro_path: z
+        .string()
+        .optional()
+        .describe("Path or registered asset name for intro video"),
+    },
+    async ({ caption_style, crop_strategy, logo_path, outro_path, intro_path }) => {
+      try {
+        const settings: Record<string, string> = {};
+
+        if (caption_style) settings.captionStyle = caption_style;
+
+        if (crop_strategy) settings.cropStrategy = crop_strategy;
+
+        if (logo_path) {
+          const resolved = await assets.resolve(logo_path);
+          settings.logoPath = resolved || logo_path;
+        }
+
+        if (outro_path) {
+          const resolved = await assets.resolve(outro_path);
+          settings.outroPath = resolved || outro_path;
+        }
+
+        if (intro_path) {
+          const resolved = await assets.resolve(intro_path);
+          settings.introPath = resolved || intro_path;
+        }
+
+        if (Object.keys(settings).length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No settings provided. Specify at least one of: caption_style, crop_strategy, logo_path, outro_path, intro_path.",
+              },
+            ],
+          };
+        }
+
+        await fetch(`${webServerUrl}/api/ui-state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ settings }),
+        });
+
+        const parts = Object.entries(settings).map(([k, v]) => `${k}=${v}`);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Settings updated: ${parts.join(", ")}`,
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: record_decisions
+  // =============================================
+  server.registerTool(
+    "record_decisions",
+    {
+      description:
+        "Record per-episode workflow decisions (clip count, clip duration range, caption style, captions on/off, " +
+        "language, whether thumbnails are wanted, delivery target, free-form notes) so later runs against the same " +
+        "video never ask the same question twice. Keyed by the video's path + file size, not by session, so these " +
+        "answers survive a new episode overwriting ui-state.json. Pass only the fields you have an answer for; " +
+        "existing answers are preserved unless explicitly overwritten. get_ui_state lists any fields still unanswered " +
+        "as open questions.",
+      inputSchema: recordDecisionsInputSchema,
+    },
+    async ({ video_path, clip_count, clip_duration_min, clip_duration_max, caption_style, captions_enabled, language, thumbnails_wanted, delivery_target, notes }) => {
+      try {
+        const keyPath = await resolveEpisodeKeyPath(video_path);
+        const decisions: RecordedDecisions = {};
+
+        if (clip_count !== undefined) decisions.clipCount = clip_count;
+
+        if (clip_duration_min !== undefined || clip_duration_max !== undefined) {
+          const existing = await episodeState.get(keyPath);
+          // A side nobody gave stays absent; 0 would read as a real limit.
+          const min = clip_duration_min ?? existing?.clipDurationRange?.min;
+          const max = clip_duration_max ?? existing?.clipDurationRange?.max;
+          decisions.clipDurationRange = {
+            ...(min !== undefined && { min }),
+            ...(max !== undefined && { max }),
+          };
+        }
+
+        if (caption_style !== undefined) decisions.captionStyle = caption_style;
+
+        if (captions_enabled !== undefined) decisions.captionsEnabled = captions_enabled;
+
+        if (language !== undefined) decisions.language = language;
+
+        if (thumbnails_wanted !== undefined) decisions.thumbnailsWanted = thumbnails_wanted;
+
+        if (delivery_target !== undefined) decisions.deliveryTarget = delivery_target;
+
+        if (notes !== undefined) decisions.notes = notes;
+
+        if (Object.keys(decisions).length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No decisions provided. Pass at least one field to record." }],
+          };
+        }
+
+        const recorded = await episodeState.record(keyPath, decisions);
+        const remaining = await episodeState.openQuestions(keyPath);
+
+        const lines = [
+          `Recorded: ${Object.keys(decisions).join(", ")}`,
+          remaining.length > 0
+            ? `Still open: ${remaining.map((q) => q.question).join(" / ")}`
+            : "All episode decisions answered.",
+        ];
+
+        void recorded;
+
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        return {
+          content: [{ type: "text" as const, text: `Error recording decisions: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: list_outputs
+  // =============================================
+  server.tool(
+    "list_outputs",
+    "List all rendered clip files in the output directory with file sizes and dates.",
+    {},
+    async () => {
+      try {
+        const res = await fetch(`${webServerUrl}/api/outputs`);
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const clips = outputClipsSchema.parse(await res.json());
+
+        if (!clips.length) {
+          return {
+            content: [
+              { type: "text" as const, text: "No rendered clips found." },
+            ],
+          };
+        }
+
+        const lines = clips.map((c) => {
+          const date = c.created ? c.created.split("T")[0] : "unknown";
+
+          return `  - ${c.filename} (${c.size_mb} MB, ${date})`;
+        });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `${clips.length} rendered clip${clips.length === 1 ? "" : "s"}:\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: manage_presets
+  // =============================================
+  server.tool(
+    "manage_presets",
+    "Save, load, list, or delete rendering presets. Presets store caption_style, crop_strategy, logo_path, and outro_path for quick reuse.",
+    {
+      action: z
+        .enum(["list", "save", "load", "delete"])
+        .describe("Preset action"),
+      name: z
+        .string()
+        .optional()
+        .describe("Preset name (required for save/load/delete)"),
+      config: z
+        .object({
+          caption_style: z
+            .enum(["hormozi", "karaoke", "subtle", "branded"])
+            .optional(),
+          crop_strategy: z.enum(["center", "face", "speaker"]).optional(),
+          logo_path: z.string().optional(),
+          outro_path: z.string().optional(),
+        })
+        .optional()
+        .describe("Preset config (for save action)"),
+    },
+    async ({ action, name, config }) => {
+      try {
+        if (["save", "load", "delete"].includes(action) && !name) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: 'name' is required for action '${action}'.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const res = await fetch(`${webServerUrl}/api/presets`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, name, config }),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = presetResultSchema.parse(await res.json());
+
+        if (data.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+
+        if (action === "list") {
+          const presets = data.presets ?? [];
+
+          if (!presets.length)
+            return {
+              content: [{ type: "text" as const, text: "No presets saved." }],
+            };
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Presets:\n${presets.map((p) => `  - ${p instanceof Object ? p.name || JSON.stringify(p) : p}`).join("\n")}`,
+              },
+            ],
+          };
+        }
+
+        if (action === "load" && data.config) {
+          // Push loaded config to UI settings
+          const settings: Record<string, string> = {};
+
+          if (data.config.caption_style)
+            settings.captionStyle = data.config.caption_style;
+
+          if (data.config.crop_strategy)
+            settings.cropStrategy = data.config.crop_strategy;
+
+          if (data.config.logo_path) settings.logoPath = data.config.logo_path;
+
+          if (data.config.outro_path)
+            settings.outroPath = data.config.outro_path;
+
+          if (Object.keys(settings).length) {
+            await fetch(`${webServerUrl}/api/ui-state`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ settings }),
+            });
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Loaded preset "${name}" and applied to UI settings.`,
+              },
+            ],
+          };
+        }
+
+        if (action === "save") {
+          return {
+            content: [
+              { type: "text" as const, text: `Saved preset "${name}".` },
+            ],
+          };
+        }
+
+        if (action === "delete") {
+          return {
+            content: [
+              { type: "text" as const, text: `Deleted preset "${name}".` },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(data) }],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: manage_thumbnail_config
+  // =============================================
+  server.tool(
+    "manage_thumbnail_config",
+    "Show, export, import, or reset the thumbnail template (colors, fonts, frame, box, layout) podcli uses to generate thumbnails. 'show' returns the effective config; 'export' writes it to a file path; 'import' replaces it from a file path; 'reset' reverts to the generic default; 'set_layout' picks the layout: 'single' (one face) or 'pair' (two people from the clip, guest left and host right, for interview clips; falls back to one face when podcli cannot tell two people apart).",
+    {
+      action: z.enum(["show", "export", "import", "reset", "set_layout"]).describe("Config action"),
+      path: z.string().optional().describe("File path for export (destination) or import (source)"),
+      layout: z
+        .enum(["single", "pair"])
+        .optional()
+        .describe("For set_layout. single: one face behind the headline. pair: the guest left and the host right, both from the clip's own footage"),
+    },
+    async ({ action, path: filePath, layout }) => {
+      try {
+        if ((action === "export" || action === "import") && !filePath) {
+          return mcpError(`'path' is required for action '${action}'.`);
+        }
+
+        if (action === "set_layout" && !layout) {
+          return mcpError("'layout' is required for action 'set_layout': 'single' or 'pair'.");
+        }
+
+        const base = `${webServerUrl}/api/thumbnail-config`;
+
+        if (action === "set_layout") {
+          const current = await fetch(base);
+
+          if (!current.ok) throw new Error(`HTTP ${current.status}`);
+
+          const res = await fetch(base, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...(await current.json()), layout }),
+          });
+
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          return { content: [{ type: "text" as const, text: `Thumbnail layout set to ${layout}.` }] };
+        }
+
+        if (action === "show") {
+          const res = await fetch(base);
+
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+        }
+
+        if (action === "export") {
+          const res = await fetch(base);
+
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          writeFileSync(filePath!, JSON.stringify(await res.json(), null, 2), "utf-8");
+
+          return { content: [{ type: "text" as const, text: `Exported thumbnail config to ${filePath}` }] };
+        }
+
+        if (action === "import") {
+          const parsed = JSON.parse(readFileSync(filePath!, "utf-8"));
+          const res = await fetch(base, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(parsed) });
+
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          return { content: [{ type: "text" as const, text: `Imported thumbnail config from ${filePath}` }] };
+        }
+
+        const res = await fetch(`${base}/reset`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        return { content: [{ type: "text" as const, text: "Reset thumbnail config to the generic default." }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return { content: [{ type: "text" as const, text: `Web UI is not running. Start with: ${studioStartCommand()}` }] };
+        }
+
+        return mcpError(msg);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: analyze_energy
+  // =============================================
+  server.tool(
+    "analyze_energy",
+    "Analyze audio energy levels for a video or specific segments. Useful for finding high-energy moments. Defaults to the current UI video and suggestions if not specified.",
+    {
+      video_path: z
+        .string()
+        .optional()
+        .describe("Path to video file (defaults to current UI video)"),
+      segments: z
+        .array(
+          z.object({
+            start: z.number(),
+            end: z.number(),
+          }),
+        )
+        .optional()
+        .describe(
+          "Specific segments to analyze (defaults to current suggestions)",
+        ),
+    },
+    async ({ video_path, segments }) => {
+      try {
+        let vPath = video_path;
+        let segs = segments;
+
+        // If no video_path, read from UI state
+        if (!vPath || !segs) {
+          const stateRes = await fetch(`${webServerUrl}/api/ui-state`);
+
+          if (stateRes.ok) {
+            const state = // SAFETY: /api/ui-state responds with the studio's UIState plus transcriptWordCount.
+            (await stateRes.json()) as ServerUIState;
+
+            if (!vPath) vPath = state.videoPath || state.filePath;
+
+            if (!segs) {
+              const suggestions = state.suggestions ?? [];
+              segs = suggestions.map((s) => ({
+                start: s.start_second,
+                end: s.end_second,
+              }));
+            }
+          }
+        }
+
+        if (!vPath) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No video path. Set a video first or provide video_path.",
+              },
+            ],
+          };
+        }
+
+        if (!segs || segs.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "No segments to analyze. Provide segments explicitly or suggest clips first.",
+              },
+            ],
+          };
+        }
+
+        const res = await fetch(`${webServerUrl}/api/analyze-energy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ video_path: vPath, segments: segs }),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = apiResponseSchema.parse(await res.json());
+
+        if (data.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: manage_reel
+  // =============================================
+  server.tool(
+    "manage_reel",
+    "Create and iterate on a highlights reel. Detection runs once with action 'new'; after that, edit individual moments fast (longer/shorter/earlier/later/shift/drop/toggle) and rebuild without re-detecting. Pass video_paths (a list) to pool many videos and rank the best moments across all of them. Actions: 'new' (video_path or video_paths, profile, format, top_n, min_dur, max_dur), 'list', 'show' (session_id), 'edit' (session_id, index, op, seconds), 'build' (session_id), 'delete' (session_id).",
+    {
+      action: z
+        .enum(["new", "list", "show", "edit", "build", "delete"])
+        .describe("What to do with the reel"),
+      video_path: z
+        .string()
+        .optional()
+        .describe("For 'new': path to the source video"),
+      video_paths: z
+        .array(z.string())
+        .optional()
+        .describe("For 'new': many source videos to pool and rank the best moments across all of them"),
+      session_id: z
+        .string()
+        .optional()
+        .describe("For show/edit/build/delete: the reel session id returned by 'new'"),
+      profile: z
+        .enum(["auto", "party", "action"])
+        .optional()
+        .describe("For 'new': detection profile (default auto)"),
+      format: z
+        .enum(["vertical", "horizontal", "square"])
+        .optional()
+        .describe("For 'new': reel aspect ratio (default horizontal)"),
+      auto: z
+        .boolean()
+        .optional()
+        .describe("For 'new': let detection pick the best moments and how many, ignoring top_n/min_dur/max_dur"),
+      logo: z
+        .string()
+        .optional()
+        .describe("For 'new'/'build': path to a logo image overlaid top-right on the reel; empty string removes it"),
+      top_n: z.number().optional().describe("For 'new': number of moments"),
+      min_dur: z.number().optional().describe("For 'new': shortest moment in seconds (default 15)"),
+      max_dur: z.number().optional().describe("For 'new': longest moment in seconds (default 60)"),
+      index: z
+        .number()
+        .optional()
+        .describe("For 'edit': 1-based moment number to adjust"),
+      op: z
+        .enum(["longer", "shorter", "earlier", "later", "shift", "set", "drop", "toggle"])
+        .optional()
+        .describe("For 'edit': how to change the moment"),
+      seconds: z
+        .number()
+        .optional()
+        .describe("For 'edit': seconds for longer/shorter/earlier/later/shift"),
+      start: z
+        .number()
+        .optional()
+        .describe("For 'edit' with op 'set': absolute start time in seconds"),
+      end: z
+        .number()
+        .optional()
+        .describe("For 'edit' with op 'set': absolute end time in seconds"),
+    },
+    async (params) => {
+      try {
+        const res = await fetch(`${webServerUrl}/api/reel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(params),
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = apiResponseSchema.parse(await res.json());
+
+        if (data.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: manage_multicam
+  // =============================================
+  server.tool(
+    "manage_multicam",
+    "Edit a full multicam podcast episode: map every camera and mic file to a person, sync them by audio (with clock-drift correction), " +
+      "auto-cut cameras to whoever is speaking, then render an MP4 or export a Premiere XML / FCPXML timeline that points at the original files. " +
+      "Flow: 'new' (folder or files, people) → check the guessed mapping with 'show' and fix it with 'map' → 'sync' → 'plan' → 'render' or 'export'. " +
+      "'new' returns the session with guessed roles; calling it again on the same files reopens that edit. " +
+      "'sync', 'plan' and 'render' start a background job and return job_id: poll job_status, then call 'show'. " +
+      "Mapping fields (people, sources, range_start, range_end, cut_settings, speaker_map, look, removals) apply on 'map', 'sync' and 'plan'; 'render' takes only look and stems. " +
+      "Changing who is in a file or where it sits clears the cut, so run 'plan' again. 'render' skips work when nothing changed and reuses shots it already encoded. " +
+      "Every render checks the finished file (frame count, a full decode, loudness and true peak) and reports outputs.validation; only a broken decode or a picture more than a frame off the cut fails it, the rest are warnings. " +
+      "Other actions: 'list', 'cut' (index, source_id: swap one shot's camera), 'set_cuts' (cuts: replace the whole cut with back-to-back shots), " +
+      "'activity' (who speaks when, as spans per person), 'previews' (still frames per camera, looks: true adds every color look on every camera), " +
+      "'preview' (background job: playback proxies, a mic mix and stills, for a browser editor such as podcli cloud), 'delete'. " +
+      "'cloud' (background job, needs podcli login and Pro: sends previews and the edit to the podcli cloud editor; camera files stay here) and " +
+      "'pull' (background job: renders the cut made in that editor from the files here). " +
+      "'export' with review: true writes a review timeline: the whole episode, every camera on its own track under the cut, and each removal left in place, named 'Remove', labelled orange in Premiere and marked with its reason. " +
+      "'import_timeline' (path) reads an FCP 7 XML timeline edited in Premiere or Resolve back as the cut and removals: deleted stretches become removals, kept ones are restored. " +
+      "With the DaVinci Resolve MCP server connected, import the review timeline into a Resolve project, color the 'Remove' clips, let the editor review, export the timeline as FCP 7 XML, then call 'import_timeline'. " +
+      "Call recordings work too: one file per person becomes a split screen, one gallery recording is split into a camera per tile; Premiere and FCPXML export refuse those layouts for now.",
+    {
+      action: z
+        .enum(["new", "list", "show", "map", "sync", "plan", "cut", "set_cuts", "activity", "previews", "preview", "render", "export", "import_timeline", "cloud", "pull", "delete"])
+        .describe("What to do"),
+      session_id: z.string().optional().describe("Session id returned by 'new' (every action except new/list)"),
+      folder: z.string().optional().describe("For 'new': folder holding one episode's recordings, scanned recursively"),
+      files: z.array(z.string()).optional().describe("For 'new': explicit media file paths, alone or with folder"),
+      people: z
+        .array(z.union([z.string(), z.object({ id: z.string().optional(), name: z.string(), role: z.enum(["host", "guest"]).optional() })]))
+        .optional()
+        .describe("For 'new': speaker names, or {name, role} (default Host, Guest; without roles the last one is the guest). For 'map': the full people list, with ids to keep and role host or guest; a guest's long answers are held on their camera"),
+      name: z.string().optional().describe("For 'new': episode name"),
+      sources: z
+        .array(
+          z.object({
+            id: z.string(),
+            role: z.enum(["camera", "mic", "ignore"]).optional(),
+            person: z.string().optional().describe("Camera: a person id or 'wide'. Mic: a person id, or '' for a shared room mic"),
+            channel_people: z.array(z.string()).optional().describe("Mic: one person id per channel when a recorder puts two people on L/R"),
+            input_lut: z.string().optional().describe("Camera: absolute path to a 3D .cube LUT (log to Rec.709, say) applied before the look in renders and stills; '' clears it. Exports list it in color_handoff.json beside the timeline"),
+            audio_stream_index: z.number().int().min(0).optional().describe("Which audio stream in the container to use, for cameras (often MXF) that carry one mono stream per mic instead of packing channels into a single stream"),
+            offset: z.number().optional().describe("Timeline seconds where this file starts, to override sync"),
+            nudge: z.number().optional().describe("Seconds to shift the synced offset by"),
+            anchors: z
+              .array(z.object({ timeline: z.number(), source: z.number() }))
+              .min(1)
+              .optional()
+              .describe(
+                "Manual sync for a file that can't sync by sound (a camera with no audio, or a fit that's off): " +
+                  "pairs of the same moment as {timeline, source} seconds. One pair sets the offset; two or more also fit clock drift by least squares. " +
+                  "Pairs must move forward together, and drift must stay within 1000 ppm. The fit reports its residual and survives later syncs unless force is true",
+              ),
+          }),
+        )
+        .optional()
+        .describe("Per-source corrections. An offset set here survives later syncs unless force is true"),
+      range_start: z.number().nullable().optional().describe("For 'map'/'plan': episode start on the timeline, null for automatic"),
+      range_end: z.number().nullable().optional().describe("For 'map'/'plan': episode end on the timeline, null for automatic"),
+      cut_settings: z
+        .object({
+          min_shot: z.number().optional().describe("Shortest shot in seconds (studio 2, remote 4)"),
+          max_shot: z.number().optional().describe("Break a longer single-host shot with a wide shot; 0 disables (studio 30, remote 0)"),
+          wide_insert: z.number().optional().describe("Length of that wide shot in seconds (default 4)"),
+          backchannel: z.number().optional().describe("Interjections shorter than this many seconds inside someone's turn never cut away (default 1.2)"),
+          hold_guest: z.boolean().optional().describe("Never cut away from a guest mid-answer (default true)"),
+          style: z.enum(["auto", "studio", "remote"]).optional().describe("studio: everyone's camera. remote: split screen, guest full frame on long answers. auto picks remote for call recordings; a new style resets the other settings to its defaults"),
+          host_solo: z.boolean().optional().describe("Give hosts their own camera when they talk (studio true, remote false)"),
+          guest_min: z.number().optional().describe("Guest turns shorter than this stay on the wide shot (remote 8 s)"),
+          guest_delay: z.number().optional().describe("A long guest answer opens on the wide shot for this long first (remote 4 s)"),
+        })
+        .optional(),
+      speaker_map: z.record(z.string(), z.string()).optional().describe("For shared-audio shows: diarization label → person id"),
+      look: z.enum(["none", "natural", "warm", "contrast"]).optional().describe("Color look used by 'render'"),
+      force: z.boolean().optional().describe("For 'sync': also re-measure offsets that were set by hand"),
+      stems: z.boolean().optional().describe("For 'render': also write one WAV per person (default true)"),
+      format: z.enum(["premiere", "fcpxml"]).optional().describe("For 'export': premiere (FCP7 XML, also opens in Resolve) or fcpxml (Final Cut Pro, Resolve)"),
+      review: z.boolean().optional().describe("For 'export': keep the whole episode with every camera on its own track and the removals in place, marked"),
+      path: z.string().optional().describe("For 'import_timeline': an FCP 7 XML timeline exported from Premiere or Resolve"),
+      index: z.number().int().min(0).optional().describe("For 'cut': 0-based shot index"),
+      source_id: z.string().optional().describe("For 'cut': camera source id to use for that shot"),
+      removals: z
+        .array(z.object({ start: z.number(), end: z.number(), reason: z.string().optional() }))
+        .optional()
+        .describe("Stretches cut out of the episode on every camera and mic, in timeline seconds; [] restores everything"),
+      cuts: z
+        .array(z.object({ start: z.number(), end: z.number(), source_id: z.string() }))
+        .optional()
+        .describe("For 'set_cuts': the full cut, shots back to back on the timeline"),
+      looks: z.boolean().optional().describe("For 'previews': include one still per color look"),
+      at: z.number().optional().describe("For 'previews': timeline second to take the stills at"),
+    },
+    async (params) => {
+      try {
+        const res = await fetch(`${webServerUrl}/api/multicam`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(params),
+        });
+
+        const data = apiResponseSchema.parse(await res.json());
+
+        if (data.error) {
+          return {
+            content: [{ type: "text" as const, text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+
+        const validation = data.outputs?.validation;
+
+        const warnings = validation?.warnings?.length
+          ? `\n\n[Render warnings]\n${validation.warnings.map((w) => `  - ${w}`).join("\n")}`
+          : "";
+
+        const text = data.job_id !== undefined
+          ? withNextStep(
+              JSON.stringify(data, null, 2),
+              `Poll job_status("${data.job_id}", wait_seconds: 30) until done, then manage_multicam(action: "show", session_id) to read the result.`,
+            )
+          : JSON.stringify(data, null, 2) + warnings;
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [{ type: "text" as const, text: `Web UI is not running. Start with: ${studioStartCommand()}` }],
+          };
+        }
+
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: set_video
+  // =============================================
+  server.tool(
+    "set_video",
+    "Set the working video file without transcribing. Use this when you'll import a transcript separately. " +
+      "After this, either transcribe_podcast or import a transcript via import_transcript / parse_transcript.",
+    {
+      file_path: z.string().describe("Absolute path to the video file"),
+    },
+    async ({ file_path }) => {
+      try {
+        // Validate via select-file endpoint
+        const selectRes = await fetch(`${webServerUrl}/api/select-file`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_path }),
+        });
+
+        if (!selectRes.ok) {
+          const err = apiErrorSchema.parse(await selectRes.json());
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: ${err.error || "File not found"}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const fileInfo = fileInfoSchema.parse(await selectRes.json());
+
+        // Push to UI state
+        await fetch(`${webServerUrl}/api/ui-state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ videoPath: file_path, filePath: file_path }),
+        });
+
+        const setText = withNextStep(
+          `Video set: ${fileInfo.filename} (${fileInfo.size_mb} MB)`,
+          `Now transcribe it: transcribe_podcast(file_path: "${file_path}")\n` +
+            "  Or if the user pastes a transcript in the UI, read it with get_ui_state(include_transcript: true)",
+        );
+
+        return { content: [{ type: "text" as const, text: setText }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: import_transcript
+  // =============================================
+  server.tool(
+    "import_transcript",
+    "Import an external transcript (e.g. from a transcription service) into the UI. Skips Whisper entirely. The transcript must include word-level timestamps.",
+    {
+      file_path: z
+        .string()
+        .describe("Path to the video file the transcript belongs to"),
+      transcript: z
+        .object({
+          words: z
+            .array(
+              z.object({
+                word: z.string(),
+                start: z.number(),
+                end: z.number(),
+                speaker: z.string().optional(),
+              }),
+            )
+            .describe("Word-level timestamps"),
+          segments: z
+            .array(
+              z.object({
+                text: z.string(),
+                start: z.number(),
+                end: z.number(),
+                speaker: z.string().optional(),
+              }),
+            )
+            .optional()
+            .describe("Segment-level transcript"),
+          duration: z.number().optional().describe("Total duration in seconds"),
+          language: z.string().optional().describe("ISO language code"),
+          text: z.string().optional().describe("Full transcript text"),
+        })
+        .describe("Transcript data with word-level timestamps"),
+    },
+    async ({ file_path, transcript }) => {
+      try {
+        const res = await fetch(`${webServerUrl}/api/import-transcript`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ file_path, transcript }),
+        });
+
+        if (!res.ok) {
+          const err = apiErrorSchema.parse(await res.json());
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: ${err.error || "Import failed"}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = importTranscriptResultSchema.parse(await res.json());
+
+        // Push transcript to UI state
+        await fetch(`${webServerUrl}/api/ui-state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript: result.data,
+            rawTranscriptText: result.data?.transcript || "",
+            phase: "review",
+            videoPath: file_path,
+            filePath: file_path,
+          }),
+        });
+
+        const wordCount = result.data?.words?.length || 0;
+        const duration = result.data?.duration || 0;
+
+        const importText = withNextStep(
+          `Transcript imported: ${wordCount} words, ${Math.round(duration)}s duration.`,
+          "Now read the transcript with get_ui_state(include_transcript: true), " +
+            "analyze it for viral moments, then call suggest_clips with your picks.",
+        );
+
+        return { content: [{ type: "text" as const, text: importText }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: parse_transcript
+  // =============================================
+  server.tool(
+    "parse_transcript",
+    "Parse a raw speaker-labeled plain text transcript into word-level timestamps. Input format: 'Speaker (MM:SS)\\ntext...\\n\\nSpeaker2 (MM:SS)\\ntext...'. Uses the Python backend to generate accurate word timings.",
+    {
+      file_path: z
+        .string()
+        .describe("Path to the video file the transcript belongs to"),
+      raw_text: z.string().describe("Raw speaker-labeled transcript text"),
+      total_duration: z
+        .number()
+        .optional()
+        .describe("Total video duration in seconds (helps accuracy)"),
+      time_adjust: z
+        .number()
+        .optional()
+        .default(0)
+        .describe("Offset in seconds to add to all timestamps"),
+      language: z
+        .string()
+        .optional()
+        .describe(
+          "ISO language code of the transcript (e.g. 'ka'). This format has no language " +
+            "info of its own, so omitting it labels the result 'und' rather than guessing.",
+        ),
+    },
+    async ({ file_path, raw_text, total_duration, time_adjust, language }) => {
+      try {
+        const res = await fetch(`${webServerUrl}/api/parse-transcript`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file_path,
+            raw_text,
+            total_duration,
+            time_adjust,
+            language,
+          }),
+        });
+
+        if (!res.ok) {
+          const err = apiErrorSchema.parse(await res.json());
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: ${err.error || "Parse failed"}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = importTranscriptResultSchema.parse(await res.json());
+
+        // Push parsed transcript to UI state
+        await fetch(`${webServerUrl}/api/ui-state`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript: result.data,
+            rawTranscriptText: result.data?.transcript || "",
+            phase: "review",
+            videoPath: file_path,
+            filePath: file_path,
+          }),
+        });
+
+        const wordCount = result.data?.words?.length || 0;
+        const segCount = result.data?.segments?.length || 0;
+
+        const parseText = withNextStep(
+          `Transcript parsed: ${wordCount} words, ${segCount} segments.`,
+          "Now read the transcript with get_ui_state(include_transcript: true), " +
+            "analyze it for viral moments, then call suggest_clips with your picks.",
+        );
+
+        return { content: [{ type: "text" as const, text: parseText }] };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+
+        if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Web UI is not running. Start with: ${studioStartCommand()}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: mine_channel
+  // =============================================
+  server.tool(
+    mineChannelToolDef.name,
+    mineChannelToolDef.description,
+    {
+      action: z.enum(["list", "mine"]).describe("'list' = a channel's uploads, 'mine' = one video's captions"),
+      channel_url: z
+        .string()
+        .optional()
+        .refine((v) => v === undefined || isHttpUrl(v), { message: "channel_url must be an http(s) URL" })
+        .describe("Channel or uploads URL (required for action=list)"),
+      video_url: z
+        .string()
+        .optional()
+        .refine((v) => v === undefined || isHttpUrl(v), { message: "video_url must be an http(s) URL" })
+        .describe("Video URL (required for action=mine)"),
+      limit: z.number().optional().describe("Max uploads to list (action=list)"),
+      cookies_from_browser: z
+        .string()
+        .optional()
+        .describe("Browser to read cookies from for members-only or unlisted content"),
+    },
+    async (input) => {
+      try {
+        const text = await handleMineChannel(input);
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // =============================================
+  // Tool: compare_transcription_engines
+  // =============================================
+  server.tool(
+    compareEnginesToolDef.name,
+    compareEnginesToolDef.description,
+    {
+      file_path: z.string().describe("Absolute path to the podcast file"),
+      engine_a: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).describe("First engine to compare"),
+      engine_b: z.enum(["whisper-py", "whispercpp", "assemblyai", "omnilingual"]).describe("Second engine to compare"),
+      start_seconds: z.number().optional().describe("Sample start, seconds into the source. Default: 0."),
+      duration_seconds: z.number().optional().describe("Sample length in seconds. Default: 120."),
+      window_seconds: z.number().optional().describe("Report window size in seconds. Default: 20."),
+      model_size: z
+        .enum(["tiny", "base", "small", "medium", "large"])
+        .optional()
+        .describe("Model size for engines that take one. Default: small."),
+      language: z.string().optional().describe("ISO language code. Leave empty for auto-detect."),
+      output_dir: z
+        .string()
+        .optional()
+        .describe("Where to write comparison.json/.html. Defaults under the podcli output directory."),
+    },
+    async (input) => {
+      try {
+        const text = await handleCompareEngines(input);
+
+        return { content: [{ type: "text" as const, text }] };
+      } catch (err: unknown) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  registerIntegrationMcpTools(server);
+
+  // =============================================
+  // MCP Prompt: workflow guide
+  // =============================================
+  server.prompt(
+    "workflow",
+    "Complete podcli workflow guide: from podcast file to finished clips",
+    async () => ({
+      messages: [
+        {
+          role: "user" as const,
+          content: {
+            type: "text" as const,
+            text: [
+              "You are a podcast clip extraction assistant using podcli MCP tools.",
+              "Follow this workflow to create viral short-form clips from podcasts:",
+              "",
+              "## Step 1: Check current state",
+              "Call get_ui_state() to see what's already loaded (video, transcript, clips).",
+              "",
+              "## Step 2: Load the podcast",
+              'If no video is set, use transcribe_podcast(file_path: "/path/to/file.mp4") to transcribe.',
+              "This both sets the video AND generates a transcript with word-level timestamps.",
+              "If the user already pasted a transcript in the UI, you can skip to Step 3.",
+              "",
+              "## Step 3: Shortlist clips without reading the whole transcript",
+              "Call rank_clip_candidates(video_path) for ~20 sentence-aligned, pre-ranked candidates.",
+              "Only call get_ui_state(include_transcript: true) if you need to rewrite a range.",
+              "",
+              "## Step 3b (one-shot): process_episode",
+              "process_episode(video_path) transcribes, ranks, and renders in one job. Poll job_status.",
+              "Use this when the user wants finished clips, not a review pass.",
+              "",
+              "## Step 4: Pick from the shortlist",
+              "From the candidates, look for:",
+              "- Controversial or surprising statements",
+              "- Strong emotional moments (laughter, passion, anger)",
+              "- Clear actionable advice or insights",
+              "- Story hooks and cliffhangers",
+              "- Quotable one-liners",
+              "- Questions that hook the viewer",
+              "",
+              "For each moment, note the start/end timestamps and craft a catchy title.",
+              "Aim for 15-45 second clips (target 20-35s). If a moment is an answer, start on the question. "
+                + "Then call suggest_clips with your picks, each carrying a payoff and a standalone check.",
+              "",
+              "## Step 5: Export",
+              "Call batch_create_clips(export_selected: true) to render all clips.",
+              "Or use create_clip(clip_number: N) for individual clips.",
+              "",
+              "## Optional: DaVinci Resolve",
+              "manage_integrations(action=enable, name=davinci_resolve) then export_to_davinci_resolve with source + caption overlay paths.",
+              "Use manage_config(action=migrate) once after upgrading if transcription cache seems empty.",
+              "If clip suggestion fails with 'No AI CLI available', call ai_cli_status then manage_env(action=set, key=PODCLI_CLAUDE_PATH, value=/path/to/claude).",
+              "",
+              "## Available caption styles:",
+              "- branded: Professional look with dark highlight box, gradient, optional logo",
+              "- hormozi: Bold uppercase, yellow highlight, high energy pop-on reveal",
+              "- karaoke: Full sentence visible, words progressively highlight",
+              "- subtle: Clean minimal white text, no effects",
+              "",
+              "## Tips:",
+              "- Use modify_clip to adjust timing before export",
+              "- Use toggle_clip to select/deselect clips",
+              "- Use update_settings to change the default caption style or crop strategy",
+              `- The user can review and adjust clips in the Web UI at ${webServerUrl}`,
+            ].join("\n"),
+          },
+        },
+      ],
+    }),
+  );
+
+  return server;
+}

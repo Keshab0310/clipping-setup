@@ -1,0 +1,575 @@
+"""
+Pack a cached transcription into a compact markdown surface for LLM reading.
+
+The goal: give an LLM everything it needs to reason about clip selection and
+cut points without watching video. Words, speakers, silences, and optional
+energy peaks fit into ~10-20KB of text.
+
+Input:  cached transcription JSON (data/cache/transcripts/<hash>.json)
+Output: packed/<hash>.md under the active config home
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from typing import Any, Optional
+
+from config.paths import paths
+from services.engines import normalize_engine
+
+def _transcripts_cache_dir() -> str:
+    return paths["transcripts"]
+
+
+def _legacy_cache_dir() -> str:
+    return paths["cache"]
+
+
+def _packed_dir() -> str:
+    return paths["packed"]
+_HASH16_RE = re.compile(r"^[a-f0-9]{16}$", re.I)
+
+# Phrase construction tuning
+SILENCE_SPLIT_SEC = 0.5      # split a phrase on word gap >= this
+SILENCE_GAP_REPORT_SEC = 0.6 # list gaps >= this in the silence section
+PHRASE_MAX_SEC = 12.0
+PHRASE_MAX_CHARS = 160
+# Below this a "." is more likely an abbreviation than a sentence end, so only
+# longer phrases get split on one. Question marks always split.
+SENTENCE_SPLIT_MIN_CHARS = 25
+ENERGY_PEAKS_TO_REPORT = 20
+REACTIONS_TO_REPORT = 20
+REACTION_REPORT_THRESHOLD = 0.15
+
+
+def compute_cache_hash(video_path: str) -> str:
+    """Match src/services/transcript-cache.ts: sha256 of first 10MB + 'size:<N>', 16 hex chars."""
+    size = os.path.getsize(video_path)
+    h = hashlib.sha256()
+    remaining = 10 * 1024 * 1024
+    with open(video_path, "rb") as f:
+        while remaining > 0:
+            chunk = f.read(min(1 << 20, remaining))
+            if not chunk:
+                break
+            h.update(chunk)
+            remaining -= len(chunk)
+    h.update(f"size:{size}".encode())
+    return h.hexdigest()[:16]
+
+
+def legacy_md5_cache_path(video_path: str) -> str:
+    stat = os.stat(video_path)
+    raw = f"{os.path.abspath(video_path)}:{stat.st_size}:{stat.st_mtime}"
+    return os.path.join(_legacy_cache_dir(), hashlib.md5(raw.encode()).hexdigest() + ".json")
+
+
+def _effective_engine(engine: str | None) -> str | None:
+    """None means "not told": fall back to the process-wide engine (the
+    same default every pre-existing caller relied on), not to whisper-py,
+    so an unset PODCLI_ENGINE=whispercpp request still lands in its own
+    namespace."""
+    return engine if engine is not None else os.environ.get("PODCLI_ENGINE", "whisper-py")
+
+
+def engine_cache_suffix(engine: str | None) -> str:
+    engine = normalize_engine(engine)
+    if engine == "whispercpp":
+        return "-whispercpp"
+    if engine == "assemblyai":
+        return "-assemblyai"
+    if engine == "omnilingual":
+        return "-omnilingual"
+    return ""
+
+
+_LANGUAGE_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def sanitize_language(language: str | None) -> str:
+    """Matches src/services/transcript-cache.ts sanitizeLanguage exactly:
+    lowercase, then strip anything outside [a-z0-9-]. The tag can come from
+    caller-supplied input, so without this a value carrying a path separator
+    would land in the cache filename unescaped."""
+    value = (language or "").strip().lower()
+    return _LANGUAGE_RE.sub("", value)
+
+
+def cache_key_suffix(engine: str | None = None, model: str | None = None, language: str | None = None) -> str:
+    """Port of src/services/transcript-cache.ts keySuffix: engine + model +
+    language. base model and auto/empty language contribute no suffix, so a
+    cache written before model/language were tracked still reads back under
+    the same key. Every Python reader/writer of the transcript cache has to
+    produce this exact suffix for a given (engine, model, language), or a
+    transcript one side writes is invisible to the other."""
+    engine_part = engine_cache_suffix(_effective_engine(engine))
+    model_norm = (model or "").strip().lower()
+    model_part = f"-m{model_norm}" if model_norm and model_norm != "base" else ""
+    language_norm = sanitize_language(language)
+    language_part = f"-l{language_norm}" if language_norm and language_norm != "auto" else ""
+    return f"{engine_part}{model_part}{language_part}"
+
+
+def transcript_json_path(
+    cache_hash: str,
+    engine: str | None = None,
+    model: str | None = None,
+    language: str | None = None,
+) -> str:
+    return os.path.join(
+        _transcripts_cache_dir(), f"{cache_hash}{cache_key_suffix(engine, model, language)}.json"
+    )
+
+
+# A suffix can only continue with "-m<model>" and/or "-l<language>" (see
+# cache_key_suffix). No other engine's suffix starts with "m" or "l", so
+# anchoring on this is enough to never cross into a different engine's files.
+_CACHE_SUFFIX_TAIL_RE = r"(?:-m[a-z0-9]+)?(?:-l[a-z0-9-]+)?\.json$"
+
+
+def find_cached_transcript_path(cache_hash: str, engine: str | None = None) -> str | None:
+    """Locate a cached transcript for this file hash when the caller does not
+    know which model/language produced it, e.g. a reel or face-map lookup
+    that only has a video path, not the transcribe request that created the
+    cache. Deterministic rule: prefer the engine-only key (base model, auto
+    language, what every pre-model/language cache, and most base-model
+    runs, write); otherwise the most recently modified matching file for
+    this hash+engine, i.e. the transcript this file most recently produced.
+    """
+    cache_dir = _transcripts_cache_dir()
+    engine_suffix = engine_cache_suffix(_effective_engine(engine))
+    exact = os.path.join(cache_dir, f"{cache_hash}{engine_suffix}.json")
+    if os.path.exists(exact):
+        return exact
+    if not os.path.isdir(cache_dir):
+        return None
+    pattern = re.compile(rf"^{re.escape(cache_hash)}{re.escape(engine_suffix)}{_CACHE_SUFFIX_TAIL_RE}")
+    candidates = [
+        os.path.join(cache_dir, name) for name in os.listdir(cache_dir) if pattern.match(name)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def load_cached_transcript_for_video(
+    video_path: str,
+    engine: str | None = None,
+    model: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any] | None:
+    cache_hash = compute_cache_hash(video_path)
+    if model is not None or language is not None:
+        # The caller knows exactly what it's asking for: read that key only,
+        # never silently substitute a different model/language's transcript.
+        canonical = transcript_json_path(cache_hash, engine=engine, model=model, language=language)
+        if os.path.exists(canonical):
+            with open(canonical, encoding="utf-8") as f:
+                return json.load(f)
+        return None
+
+    found = find_cached_transcript_path(cache_hash, engine=engine)
+    if found:
+        with open(found, encoding="utf-8") as f:
+            return json.load(f)
+    # The legacy md5 cache predates the engine split and only ever held
+    # whisper-py output, so don't let a whisper.cpp run adopt it under its own
+    # namespace.
+    if engine_cache_suffix(_effective_engine(engine)) == "":
+        legacy = legacy_md5_cache_path(video_path)
+        if os.path.exists(legacy):
+            with open(legacy, encoding="utf-8") as f:
+                data = json.load(f)
+            save_cached_transcript_for_video(video_path, data, engine=engine)
+            return data
+    return None
+
+
+def save_cached_transcript_for_video(
+    video_path: str,
+    data: dict[str, Any],
+    engine: str | None = None,
+    model: str | None = None,
+    language: str | None = None,
+) -> str:
+    cache_hash = compute_cache_hash(video_path)
+    path = transcript_json_path(cache_hash, engine=engine, model=model, language=language)
+    os.makedirs(_transcripts_cache_dir(), exist_ok=True)
+    # Write-then-rename: a reader never observes a half-written cache file,
+    # matching src/services/transcript-cache.ts's set().
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp_path, path)
+    return path
+
+
+def migrate_transcript_cache_layout() -> dict[str, Any]:
+    result = {"moved_to_transcripts": 0, "skipped": 0}
+    os.makedirs(_transcripts_cache_dir(), exist_ok=True)
+    legacy_dir = _legacy_cache_dir()
+    if not os.path.isdir(legacy_dir):
+        return result
+    for fname in os.listdir(legacy_dir):
+        if not fname.endswith(".json") or fname == "encoder.json":
+            continue
+        stem = fname[:-5]
+        if not _HASH16_RE.match(stem):
+            continue
+        src = os.path.join(legacy_dir, fname)
+        dest = os.path.join(_transcripts_cache_dir(), fname)
+        if os.path.exists(dest):
+            result["skipped"] += 1
+            continue
+        os.rename(src, dest)
+        result["moved_to_transcripts"] += 1
+    return result
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    return f"{m}m {s}s"
+
+
+def _fmt_ts(seconds: float) -> str:
+    return f"{seconds:07.2f}"
+
+
+def _normalize_speakers(speakers_block) -> dict[str, dict]:
+    """Return {raw_id: {total_time, label, segments}} regardless of input shape.
+
+    Accepts two shapes:
+      - transcribe output: {"num_speakers": N, "speakers": {SPEAKER_00: {...}}}
+      - parse_transcript output: [{"id": SPEAKER_0, "label": ..., "total_time": ...}]
+    """
+    if isinstance(speakers_block, dict):
+        inner = speakers_block.get("speakers", {})
+        if isinstance(inner, dict):
+            return inner
+        speakers_block = inner  # list fall-through
+    if isinstance(speakers_block, list):
+        return {
+            entry.get("id", f"S{i}"): {
+                "total_time": entry.get("total_time", 0),
+                "label": entry.get("label", entry.get("id", f"S{i}")),
+                "segments": entry.get("segments", 0),
+            }
+            for i, entry in enumerate(speakers_block)
+            if isinstance(entry, dict)
+        }
+    return {}
+
+
+def _speaker_short_map(speakers_block) -> dict[str, str]:
+    """Map speaker IDs AND labels to short codes (S0, S1, ...) sorted by talk time.
+
+    Accepts either key: transcribe output uses SPEAKER_00 everywhere, but
+    parse_transcript uses labels ("Host") in word.speaker/segment.speaker
+    while keeping SPEAKER_0 as the canonical id. Mapping both avoids S? holes.
+    """
+    normalized = _normalize_speakers(speakers_block)
+    ranked = sorted(
+        normalized.items(),
+        key=lambda kv: kv[1].get("total_time", 0),
+        reverse=True,
+    )
+    short: dict[str, str] = {}
+    for i, (raw_id, info) in enumerate(ranked):
+        code = f"S{i}"
+        short[raw_id] = code
+        label = info.get("label")
+        if label and label not in short:
+            short[label] = code
+    return short
+
+
+def _speaker_at(speaker_segments: list[dict], t: float, last_known: Optional[str]) -> Optional[str]:
+    """Return the raw speaker ID whose segment contains time t, else last_known."""
+    for seg in speaker_segments:
+        if seg["start"] <= t <= seg["end"]:
+            return seg["speaker"]
+    return last_known
+
+
+def _ends_sentence(text: str, mark_only: bool = False) -> bool:
+    """True when a word closes a sentence, ignoring trailing quotes/brackets."""
+    stripped = text.rstrip().rstrip("\"')]}\u2019\u201d")
+    return stripped.endswith("?") if mark_only else stripped.endswith(("?", ".", "!"))
+
+
+def _build_phrases(
+    words: list[dict],
+    short: dict[str, str],
+    speaker_segments: list[dict],
+) -> list[dict]:
+    """Group words into phrases by speaker + silence gaps.
+
+    Uses speaker_segments as authoritative for speaker attribution, because per-word
+    speaker fields are often noisy at segment boundaries, causing single-word
+    fragments that make the transcript unreadable.
+
+    Sentence ends close a phrase once it is long enough to not be an
+    abbreviation. Boundaries the selector can cut on have to be boundaries a
+    listener hears, and a phrase that runs "...in the Amazon. Why did you want
+    to" gives it nowhere clean to start. Diarization drifts a word or two at a
+    turn, so this matters most exactly where speaker labels exist.
+    """
+    phrases: list[dict] = []
+    current: Optional[dict] = None
+    last_known: Optional[str] = None
+
+    for w in words:
+        text = w.get("word", "")
+        if not text:
+            continue
+        start = float(w.get("start", 0.0))
+        end = float(w.get("end", start))
+        mid = (start + end) / 2
+        raw_spk = _speaker_at(speaker_segments, mid, last_known) or w.get("speaker") or last_known
+        if raw_spk is None:
+            raw_spk = "UNKNOWN"
+        last_known = raw_spk
+        spk = short.get(raw_spk, "S?")
+
+        broke_sentence = current is not None and _ends_sentence(
+            current["text"],
+            mark_only=len(current["text"]) < SENTENCE_SPLIT_MIN_CHARS,
+        )
+
+        should_split = (
+            current is None
+            or current["speaker"] != spk
+            or broke_sentence
+            or (start - current["end"]) >= SILENCE_SPLIT_SEC
+            or (end - current["start"]) >= PHRASE_MAX_SEC
+            or (len(current["text"]) + len(text) + 1) >= PHRASE_MAX_CHARS
+        )
+
+        if should_split:
+            if current is not None:
+                phrases.append(current)
+            current = {"speaker": spk, "start": start, "end": end, "text": text.lstrip()}
+        else:
+            glue = "" if text.startswith(("'", ",", ".", "?", "!", ";", ":")) else " "
+            current["text"] += f"{glue}{text}"
+            current["end"] = end
+
+    if current is not None:
+        phrases.append(current)
+    return phrases
+
+
+def _find_silence_gaps(words: list[dict], min_gap: float) -> list[dict]:
+    gaps = []
+    for prev, nxt in zip(words, words[1:]):
+        gap = float(nxt.get("start", 0.0)) - float(prev.get("end", 0.0))
+        if gap >= min_gap:
+            gaps.append({
+                "start": float(prev.get("end", 0.0)),
+                "end": float(nxt.get("start", 0.0)),
+                "duration": gap,
+            })
+    return gaps
+
+
+def _phrase_for_time(phrases: list[dict], t: float) -> Optional[dict]:
+    for p in phrases:
+        if p["start"] <= t <= p["end"]:
+            return p
+    # nearest
+    if not phrases:
+        return None
+    return min(phrases, key=lambda p: min(abs(p["start"] - t), abs(p["end"] - t)))
+
+
+def pack_transcript(
+    transcript: dict,
+    source_label: str,
+    energy_data: Optional[list[dict]] = None,
+    events_data: Optional[list[dict]] = None,
+) -> str:
+    """Render a packed markdown view of a transcription JSON."""
+    duration = float(transcript.get("duration", 0.0))
+    language = transcript.get("language", "?")
+    words = transcript.get("words", [])
+    speakers_block = transcript.get("speakers", {}) or {}
+    speakers_map = _normalize_speakers(speakers_block)
+    num_speakers = (
+        speakers_block.get("num_speakers")
+        if isinstance(speakers_block, dict)
+        else None
+    ) or len(speakers_map)
+
+    short = _speaker_short_map(speakers_block)
+    speaker_segments = transcript.get("speaker_segments", []) or []
+    phrases = _build_phrases(words, short, speaker_segments)
+    # Derived from what was emitted, not from num_speakers: a summary can claim
+    # two speakers while the segments and per-word labels are both missing, and
+    # then every line still reads "S?" with no warning to say so.
+    no_speaker_labels = bool(phrases) and all(p["speaker"] == "S?" for p in phrases)
+    gaps = _find_silence_gaps(words, SILENCE_GAP_REPORT_SEC)
+
+    lines: list[str] = []
+    lines.append(f"# Episode: {source_label}")
+    lines.append(
+        f"duration: {_fmt_duration(duration)} · language: {language} · "
+        f"speakers: {num_speakers} · words: {len(words)} · phrases: {len(phrases)}"
+    )
+    lines.append("")
+
+    # Speakers summary
+    lines.append("## Speakers")
+    ranked = sorted(
+        speakers_map.items(),
+        key=lambda kv: kv[1].get("total_time", 0),
+        reverse=True,
+    )
+    for raw_id, info in ranked:
+        talk = float(info.get("total_time", 0))
+        pct = (talk / duration * 100) if duration > 0 else 0
+        label = info.get("label") or raw_id
+        lines.append(
+            f"- {short[raw_id]} ({label}): {_fmt_duration(talk)} · {pct:.0f}%"
+        )
+    lines.append("")
+
+    # Transcript phrases
+    lines.append("## Transcript")
+    if no_speaker_labels:
+        lines.append(
+            "> No speaker labels for this transcript, so every line reads S? and lines "
+            "break at sentence ends rather than at speaker turns. You cannot tell who "
+            "is asking from who is answering here: do not guess. Re-run transcription "
+            "with speaker detection on before selecting clips that depend on it."
+        )
+        lines.append("")
+    for p in phrases:
+        lines.append(
+            f"[{_fmt_ts(p['start'])}-{_fmt_ts(p['end'])}] {p['speaker']} {p['text']}"
+        )
+    lines.append("")
+
+    # Silence gaps
+    if gaps:
+        lines.append(f"## Silence gaps (>={SILENCE_GAP_REPORT_SEC}s)")
+        for g in gaps:
+            lines.append(
+                f"[{_fmt_ts(g['start'])}-{_fmt_ts(g['end'])}] {g['duration']:.2f}s"
+            )
+        lines.append("")
+
+    # Energy peaks (optional)
+    if energy_data:
+        sorted_by_rms = sorted(energy_data, key=lambda e: e.get("rms_db", -999), reverse=True)
+        peaks = sorted_by_rms[:ENERGY_PEAKS_TO_REPORT]
+        peaks.sort(key=lambda e: e.get("time", 0))
+        lines.append(f"## Energy peaks (top {len(peaks)})")
+        for e in peaks:
+            t = float(e.get("time", 0))
+            rms = float(e.get("rms_db", 0))
+            near = _phrase_for_time(phrases, t)
+            snippet = ""
+            if near:
+                txt = near["text"]
+                snippet = f' near: "{txt[:70]}{"…" if len(txt) > 70 else ""}"'
+            lines.append(f"[{_fmt_ts(t)}] {rms:.1f}dB{snippet}")
+        lines.append("")
+
+    # Laughter & reactions (optional): the moment BEFORE a laugh is usually the
+    # clippable one, so these timestamps flag where to look for the setup.
+    if events_data:
+        def level(e):
+            return max(e.get("laughter", 0), e.get("cheering", 0), e.get("screaming", 0))
+        reactions = [e for e in events_data if level(e) >= REACTION_REPORT_THRESHOLD]
+        reactions.sort(key=level, reverse=True)
+        reactions = reactions[:REACTIONS_TO_REPORT]
+        reactions.sort(key=lambda e: e.get("time", 0))
+        if reactions:
+            lines.append(f"## Laughter & reactions (top {len(reactions)})")
+            for e in reactions:
+                t = float(e.get("time", 0))
+                kind = max(
+                    ("laughter", "cheering", "screaming"),
+                    key=lambda k: e.get(k, 0),
+                )
+                near = _phrase_for_time(phrases, t)
+                snippet = ""
+                if near:
+                    txt = near["text"]
+                    snippet = f' near: "{txt[:70]}{"…" if len(txt) > 70 else ""}"'
+                lines.append(f"[{_fmt_ts(t)}] {kind} {e.get(kind, 0):.2f}{snippet}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def load_cache(cache_hash: str) -> dict:
+    path = transcript_json_path(cache_hash)
+    if not os.path.exists(path):
+        legacy = os.path.join(_legacy_cache_dir(), f"{cache_hash}.json")
+        if os.path.exists(legacy):
+            path = legacy
+        else:
+            raise FileNotFoundError(f"Transcript cache not found: {cache_hash}")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def packed_path_for(cache_hash: str) -> str:
+    return os.path.join(_packed_dir(), f"{cache_hash}.md")
+
+
+def write_packed(
+    transcript: dict,
+    cache_hash: str,
+    source_label: Optional[str] = None,
+    energy_data: Optional[list[dict]] = None,
+    events_data: Optional[list[dict]] = None,
+) -> tuple[str, str]:
+    """Pack a transcript dict and write to .podcli/packed/<hash>.md."""
+    label = source_label or cache_hash
+    md = pack_transcript(transcript, label, energy_data=energy_data, events_data=events_data)
+    os.makedirs(_packed_dir(), exist_ok=True)
+    out_path = packed_path_for(cache_hash)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(md)
+    return out_path, md
+
+
+def pack_from_hash(cache_hash: str, source_label: Optional[str] = None) -> tuple[str, str]:
+    """Pack a cached transcript by its hash. Returns (output_path, markdown)."""
+    transcript = load_cache(cache_hash)
+    return write_packed(transcript, cache_hash, source_label)
+
+
+def pack_from_video(video_path: str) -> tuple[str, str]:
+    """Pack a transcript given the source video path."""
+    cache_hash = compute_cache_hash(video_path)
+    label = os.path.basename(video_path)
+    return pack_from_hash(cache_hash, label)
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("usage: python -m services.transcript_packer <video-path-or-cache-hash>", file=sys.stderr)
+        return 2
+    target = argv[1]
+    if os.path.exists(target):
+        out_path, md = pack_from_video(target)
+    else:
+        out_path, md = pack_from_hash(target)
+    size_kb = len(md.encode("utf-8")) / 1024
+    print(f"wrote {out_path} ({size_kb:.1f} KB)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))

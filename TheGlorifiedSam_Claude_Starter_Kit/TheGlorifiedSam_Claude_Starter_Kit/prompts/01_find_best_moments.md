@@ -1,0 +1,1 @@
+Transcribe [VIDEO FILE] with word timestamps. Then find the 5 best 15–35 second moments for a vertical short. Each needs a hook in the first second, a clear reaction and a payoff. For each, give the start and end times, a one-line hook in ALL CAPS, and why it works. Skip anything with slurs or anything you'd need permission to use.

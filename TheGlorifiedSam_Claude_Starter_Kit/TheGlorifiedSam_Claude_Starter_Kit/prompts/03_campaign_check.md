@@ -1,0 +1,1 @@
+Open [CAMPAIGN PAGE LINK] and read the full brief and rules. Tell me: the pay per 1K views, the minimum payout, the views needed per clip, required hashtags, captions and overlays, allowed platforms, audience requirements and deadlines. Quote the page; don't guess.

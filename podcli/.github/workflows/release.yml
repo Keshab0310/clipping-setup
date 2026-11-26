@@ -1,0 +1,286 @@
+# Cuts a release on a v* tag: cross-compiles the Go launcher for the 4 targets
+# in the build matrix, builds whisper.cpp / ffmpeg / studio / remotion bundles
+# per platform, and publishes everything as release assets (the names
+# self-update and the provisioner expect). Distribution is the install script
+# plus these assets; there is no npm publish (the name is blocked, see RELEASE.md).
+#
+# The whisper.cpp matrix below is unverified until the first tagged run, so the
+# binary name / cmake flags may need adjustment for the pinned whisper.cpp ref.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default to read-only; only the release job that publishes assets gets write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # darwin builds on macOS so the arm64 binary is signed in a way Apple
+    # Silicon's kernel accepts; cross-compiling it on Linux yields a binary the
+    # kernel SIGKILLs at exec.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-latest, goos: darwin, goarch: arm64 }
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64 }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm64 }
+          - { runner: ubuntu-latest, goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.23'
+          cache: false
+      - name: Build launcher
+        working-directory: cli
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          go generate ./...   # sync backend + PodStack commands for go:embed, write VERSION
+          # The launcher embeds VERSION (generated from package.json). Refuse to ship a
+          # tag that disagrees with it rather than publish a mislabelled binary.
+          EMBEDDED="$(cat VERSION)"
+          if [ "$VERSION" != "$EMBEDDED" ]; then
+            echo "tag v${VERSION} does not match package.json version ${EMBEDDED}" >&2
+            exit 1
+          fi
+          EXT=""
+          [ "${{ matrix.goos }}" = "windows" ] && EXT=".exe"
+          OUT="podcli-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
+          go build -trimpath -ldflags "-s -w" -o "../${OUT}" .
+          echo "ASSET=${OUT}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+
+  whisper:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest, goos: darwin, goarch: arm64 }
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64 }
+          - { runner: windows-latest, goos: windows, goarch: amd64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      WHISPER_REF: v1.7.4 # pin a known-good whisper.cpp tag
+    steps:
+      - name: Clone whisper.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ env.WHISPER_REF }}
+          persist-credentials: false
+      - name: Build (static; Metal embedded on macOS)
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "${{ matrix.goos }}" = "darwin" ]; then EXTRA="-DGGML_METAL_EMBED_LIBRARY=ON"; else EXTRA="-DGGML_NATIVE=OFF"; fi
+          cmake -B build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release $EXTRA
+          cmake --build build --config Release --target whisper-cli -j
+      - name: Stage asset
+        shell: bash
+        run: |
+          EXT=""; [ "${{ matrix.goos }}" = "windows" ] && EXT=".exe"
+          SRC=$(find build -name "whisper-cli${EXT}" -type f | head -1)
+          OUT="whisper-cli-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}"
+          cp "$SRC" "$OUT"
+          echo "ASSET=$OUT" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+
+  # Apple Silicon only. Linux and Windows already get correct native builds from
+  # the static sources the provisioner uses; macOS has no upstream arm64 static,
+  # and the URL we pointed at serves x86_64 to every Mac, so ffmpeg ran under
+  # Rosetta at roughly a third of native encode speed.
+  ffmpeg-darwin:
+    runs-on: macos-latest
+    env:
+      FFMPEG_VERSION: '7.1'
+      FFMPEG_SHA256: 40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6
+      X264_COMMIT: b35605ace3ddf7c1a5d67a2eb553f034aef41d55 # stable as of 2026-07-12
+    steps:
+      - name: Build ffmpeg (arm64, static libx264)
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install --quiet nasm pkg-config
+          deps="$GITHUB_WORKSPACE/deps"
+          # Pin x264 by commit: "stable" moves, and whatever it points at ends up
+          # inside a binary we hand to users. Static-only because Homebrew's prefix
+          # carries libx264.dylib next to the .a and ld prefers the dylib, which
+          # would bake a Homebrew path into a binary shipped to machines with no
+          # Homebrew.
+          git clone -q https://code.videolan.org/videolan/x264.git
+          git -C x264 checkout -q "$X264_COMMIT"
+          (cd x264 && ./configure --prefix="$deps" --enable-static --enable-pic --disable-cli && make -j"$(sysctl -n hw.ncpu)" && make install)
+          curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz
+          # ffmpeg.org publishes no checksum file, so pin the digest here: an
+          # unverified tarball would compile straight into a release asset.
+          echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | shasum -a 256 -c -
+          tar xf ffmpeg.tar.xz && cd "ffmpeg-${FFMPEG_VERSION}"
+          # --disable-autodetect, then opt in by name. Without it configure absorbs
+          # whatever happens to sit on the build machine: the runner has Homebrew
+          # X11/xcb, so ffmpeg linked /opt/homebrew dylibs and would not have run
+          # on a user's Mac. VideoToolbox has to come back explicitly: encoder.py
+          # picks h264_videotoolbox on macOS, and losing it would cost more than
+          # Rosetta ever did.
+          PKG_CONFIG_PATH="$deps/lib/pkgconfig" ./configure \
+            --disable-autodetect \
+            --enable-gpl --enable-libx264 \
+            --enable-videotoolbox --enable-audiotoolbox --enable-zlib \
+            --pkg-config-flags=--static \
+            --extra-cflags="-I$deps/include" --extra-ldflags="-L$deps/lib" \
+            --disable-shared --enable-static \
+            --disable-doc --disable-debug --disable-ffplay
+          make -j"$(sysctl -n hw.ncpu)" ffmpeg ffprobe
+          cd ..
+          cp "ffmpeg-${FFMPEG_VERSION}/ffmpeg" ffmpeg-darwin-arm64
+          cp "ffmpeg-${FFMPEG_VERSION}/ffprobe" ffprobe-darwin-arm64
+      - name: Verify the binaries are native and self-contained
+        shell: bash
+        run: |
+          set -euo pipefail
+          for b in ffmpeg-darwin-arm64 ffprobe-darwin-arm64; do
+            # lipo, not `file | grep arm64`: that also matches a universal binary
+            # carrying an x86_64 slice, which is what we are trying to stop shipping.
+            [ "$(lipo -archs "$b")" = "arm64" ] || { echo "$b is not arm64-only: $(lipo -archs "$b")"; exit 1; }
+            if otool -L "$b" | tail -n +2 | grep -qv -e '/usr/lib/' -e '/System/'; then
+              echo "$b links a non-system library:"; otool -L "$b"; exit 1
+            fi
+          done
+          # h264_videotoolbox is what encoder.py reaches for on macOS. A build that
+          # quietly lost it would fall back to libx264 and be slower than the
+          # Rosetta binary this job exists to replace, so treat its absence as a
+          # failed build rather than a working one.
+          for enc in libx264 h264_videotoolbox; do
+            ./ffmpeg-darwin-arm64 -hide_banner -encoders | grep -q "$enc" || { echo "missing encoder: $enc"; exit 1; }
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ffmpeg-darwin-arm64
+          path: |
+            ffmpeg-darwin-arm64
+            ffprobe-darwin-arm64
+
+  studio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20'
+          cache: ''
+      - name: Build studio bundle
+        run: |
+          npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
+          npm ci
+          sh scripts/build-studio.sh dist/studio
+          tar -czf studio-bundle.tar.gz -C dist/studio .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: studio-bundle.tar.gz
+          path: studio-bundle.tar.gz
+
+  remotion:
+    # Per-platform: @rspack and the Remotion compositor ship native binaries, so
+    # the bundle is not portable across os/arch.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest, goos: darwin, goarch: arm64 }
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64 }
+          - { runner: windows-latest, goos: windows, goarch: amd64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20'
+          cache: ''
+      - name: Build remotion bundle
+        shell: bash
+        run: |
+          sh scripts/build-remotion.sh dist/remotion-bundle
+          OUT="remotion-bundle-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+          tar -czf "$OUT" -C dist/remotion-bundle .
+          echo "ASSET=$OUT" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: [build, whisper, studio, remotion, ffmpeg-darwin]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      LANDING_DISPATCH_TOKEN: ${{ secrets.LANDING_DISPATCH_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum * > "$RUNNER_TEMP/checksums.txt"
+          mv "$RUNNER_TEMP/checksums.txt" checksums.txt
+      - name: Assert the release asset set is complete
+        working-directory: dist
+        run: |
+          set -eu
+          expected="podcli-darwin-arm64 podcli-linux-amd64 podcli-linux-arm64 podcli-windows-amd64.exe \
+          whisper-cli-darwin-arm64 whisper-cli-linux-amd64 whisper-cli-linux-arm64 whisper-cli-windows-amd64.exe \
+          remotion-bundle-darwin-arm64.tar.gz remotion-bundle-linux-amd64.tar.gz remotion-bundle-linux-arm64.tar.gz remotion-bundle-windows-amd64.tar.gz \
+          ffmpeg-darwin-arm64 ffprobe-darwin-arm64 studio-bundle.tar.gz checksums.txt"
+          fail=0
+          for f in $expected; do
+            [ -f "$f" ] || { echo "::error::missing release asset: $f"; fail=1; }
+          done
+          for f in $expected; do
+            [ "$f" = checksums.txt ] && continue
+            grep -q " $f\$" checksums.txt || { echo "::error::checksums.txt has no entry for $f"; fail=1; }
+          done
+          # An unlisted file would be published unreviewed; treat it as a failure too.
+          for f in *; do
+            case " $expected " in *" $f "*) ;; *) echo "::error::unexpected file in dist/: $f"; fail=1 ;; esac
+          done
+          [ "$fail" -eq 0 ] || { echo "::error::release asset set is incomplete or wrong; refusing to publish"; exit 1; }
+          echo "all 16 release assets present, every binary checksummed"
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/*
+          generate_release_notes: true
+      - name: Warn that the landing changelog will not rebuild
+        if: ${{ env.LANDING_DISPATCH_TOKEN == '' }}
+        run: echo "::warning::LANDING_DISPATCH_TOKEN is unset; skipping the landing site dispatch, so podcli.com's changelog will not pick up ${GITHUB_REF_NAME}."
+      - name: Rebuild the landing site so the changelog picks up this release
+        if: ${{ env.LANDING_DISPATCH_TOKEN != '' }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer $LANDING_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/nmbrthirteen/podcli-landing/dispatches \
+            -d "{\"event_type\":\"release\",\"client_payload\":{\"tag\":\"${GITHUB_REF_NAME}\"}}"

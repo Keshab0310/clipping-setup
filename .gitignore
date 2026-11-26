@@ -1,0 +1,14 @@
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.part
+*.log
+*.pyc
+__pycache__/
+node_modules/
+venv/
+.venv/
+.env

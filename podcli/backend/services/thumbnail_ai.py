@@ -1,0 +1,897 @@
+"""
+AI-driven thumbnail generator.
+
+1. Extract candidate frames from video (OpenCV)
+2. Claude analyzes frames + clip content → generates HTML with exact CSS
+3. Playwright renders HTML → PNG
+
+Claude makes ALL visual decisions: crop, text size, positioning, colors.
+The config provides brand constraints (accent color, logo, font), Claude works within them.
+"""
+
+import json
+import os
+import subprocess
+from utils.proc import run as proc_run
+from utils.log import log_event, warn as log_warn
+import sys
+import tempfile
+import base64
+from typing import Optional
+
+from config.paths import paths
+
+
+def _load_brand_config() -> dict:
+    """Load brand constraints from thumbnail-config.json."""
+    defaults = {
+        "width": 1080,
+        "height": 1920,
+        "accent_color": "#00CED1",
+        "bg_color": "#0D0D0D",
+        # Keep this fallback stack in sync with thumbnail_html.py's defaults and
+        # remotion/src/types.ts FONT. 'Inter' alone has no Georgian glyphs.
+        "font_family": "'Inter', 'Helvetica Neue', 'Arial', 'Noto Sans Georgian', sans-serif",
+        "enabled": True,
+        "variations": 3,
+    }
+    config_path = paths["thumbnailConfig"]
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                defaults.update(json.load(f))
+        except Exception as exc:
+            log_warn("thumbnail", "thumbnail config unreadable, using defaults", error=exc)
+    return defaults
+
+
+def _normalize_roi(gray, target_width: int = 320):
+    import cv2
+    h, w = gray.shape[:2]
+    if w <= 0 or h <= 0:
+        return gray
+    if w == target_width:
+        return gray
+    scale = target_width / w
+    new_h = max(1, int(h * scale))
+    return cv2.resize(gray, (target_width, new_h), interpolation=cv2.INTER_AREA)
+
+
+def _tile_bounds_for_face(gray, face_cx: int) -> tuple[int, int]:
+    import cv2
+    import numpy as np
+    h, w = gray.shape[:2]
+    if w < 640 or h < 1:
+        return 0, w
+    gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    seam_frac = np.mean(np.abs(gx) > 15, axis=0)
+    col_mean = np.mean(gray, axis=0)
+    col_max = np.max(gray, axis=0)
+    is_boundary = (seam_frac > 0.5) | ((col_mean <= 24) & (col_max <= 48))
+    bounds = [0]
+    for x in range(2, w - 2):
+        if is_boundary[x] and (not bounds or x - bounds[-1] > w * 0.15):
+            bounds.append(x)
+    bounds.append(w)
+    for i in range(len(bounds) - 1):
+        if bounds[i] <= face_cx < bounds[i + 1]:
+            return bounds[i], bounds[i + 1]
+    return 0, w
+
+
+def _frame_sharpness(frame, face_roi=None) -> float:
+    """Laplacian variance: higher = sharper. Measures face region if provided."""
+    import cv2
+    if face_roi is not None:
+        x1, y1, x2, y2 = face_roi
+        region = frame[y1:y2, x1:x2]
+    else:
+        region = frame
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    gray = _normalize_roi(gray)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def _face_expression_quality(frame, x1: int, y1: int, x2: int, y2: int) -> float:
+    """
+    Estimate facial expression quality (0 to 1).
+    Rejects: looking down/away, closed eyes, wide open mouth, blur, bad angles.
+    Higher = better thumbnail candidate. Threshold should be >= 0.5.
+    """
+    import cv2
+    import numpy as np
+
+    region = frame[y1:y2, x1:x2]
+    h, w = region.shape[:2]
+    if h < 30 or w < 30:
+        return 0.3
+
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    gray = _normalize_roi(gray)
+    h, w = gray.shape[:2]
+
+    # 1) Face angle: reject extreme tilt (looking down, sideways)
+    #    A front-facing face has the brightest area (forehead) in the top third.
+    #    Looking down shifts brightness to forehead being occluded.
+    top_third = gray[:int(h * 0.33), :]
+    mid_third = gray[int(h * 0.33):int(h * 0.66), :]
+    bot_third = gray[int(h * 0.66):, :]
+    top_brightness = float(np.mean(top_third))
+    mid_brightness = float(np.mean(mid_third))
+    bot_brightness = float(np.mean(bot_third))
+
+    # Looking down: top third is much darker than bottom (forehead hidden, chin/neck visible)
+    if top_brightness < mid_brightness * 0.7:
+        return 0.2  # Looking down: terrible for thumbnails
+
+    # 2) Face symmetry: detect extreme side angles
+    #    A frontal face has roughly symmetric left/right brightness
+    left_half = gray[:, :w // 2]
+    right_half = gray[:, w // 2:]
+    symmetry = 1.0 - abs(float(np.mean(left_half)) - float(np.mean(right_half))) / 128.0
+    if symmetry < 0.7:
+        return 0.3  # Extreme side angle
+
+    # 3) Eye region check (top 25-45% of face)
+    eye_region = gray[int(h * 0.25):int(h * 0.45), :]
+    if eye_region.size > 0:
+        eye_sharpness = cv2.Laplacian(eye_region, cv2.CV_64F).var()
+        if eye_sharpness < 15:
+            return 0.25  # Eyes closed or blinking
+    else:
+        eye_sharpness = 50
+
+    # 4) Mouth region check (bottom 30% of face)
+    mouth_region = gray[int(h * 0.65):, :]
+    mouth_penalty = 0.0
+    if mouth_region.size > 0:
+        mouth_var = cv2.Laplacian(mouth_region, cv2.CV_64F).var()
+        if mouth_var > 200:
+            mouth_penalty = 0.35  # Wide open mouth
+        elif mouth_var > 120:
+            mouth_penalty = 0.15
+
+    # 5) Overall face sharpness: catch motion blur
+    face_sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if face_sharpness < 25:
+        return 0.3  # Motion blur
+
+    # 6) Face bounding box aspect ratio
+    aspect = h / max(1, w)
+    if aspect < 0.7 or aspect > 1.4:
+        return 0.35  # Odd angle or distortion
+
+    # 7) Expressiveness: reward animated faces over flat/neutral ones.
+    #    Engaged speakers have higher variance in the eyebrow region (raised brows)
+    #    and moderate mouth activity (mid-speech, not slack-jawed).
+    brow_region = gray[int(h * 0.15):int(h * 0.30), :]
+    brow_var = cv2.Laplacian(brow_region, cv2.CV_64F).var() if brow_region.size > 0 else 30
+    # Mouth slightly open (mid-word) is more engaging than closed/neutral
+    mouth_activity = mouth_var if mouth_region.size > 0 else 30
+    # Brow raise + moderate mouth = expressive. Flat brow + closed mouth = neutral.
+    expressiveness = min(1.0, (brow_var / 80.0) * 0.6 + min(1.0, mouth_activity / 80.0) * 0.4)
+    expressiveness = max(0.3, expressiveness)  # don't zero out, just penalize flat
+
+    # Combine: eye sharpness × symmetry × (1 - mouth penalty) × expressiveness
+    eye_score = min(1.0, eye_sharpness / 60.0)
+    quality = eye_score * symmetry * (1.0 - mouth_penalty) * expressiveness
+    return max(0.15, min(1.0, quality))
+
+
+# Below either floor a face is blurred, blinking or turned away. Kept only
+# when nothing better exists, so a clip still gets a picture.
+EXPRESSION_FLOOR = 0.25
+SHARPNESS_FLOOR = 12.0
+
+
+def face_portrait_score(frame, x1: int, y1: int, x2: int, y2: int, confidence: float) -> tuple[float, float, float]:
+    """How well one detected face would read on a thumbnail.
+
+    Returns (score, sharpness, expression quality). Favors a confident,
+    sharp, front-facing face at a natural portrait size over an extreme
+    close-up or a speck in the background.
+    """
+    h, w = frame.shape[:2]
+    face_area_pct = (x2 - x1) * (y2 - y1) / max(1, w * h) * 100
+    sharpness = _frame_sharpness(frame, (x1, y1, x2, y2))
+    expression_quality = _face_expression_quality(frame, x1, y1, x2, y2)
+
+    if face_area_pct > 35:
+        size_factor = 0.4
+    elif face_area_pct > 25:
+        size_factor = 0.7
+    elif face_area_pct < 3:
+        size_factor = 0.5
+    else:
+        size_factor = 1.0
+
+    score = (confidence ** 2) * (sharpness ** 0.5) * size_factor * expression_quality
+    return score, sharpness, expression_quality
+
+
+def extract_candidate_frames(
+    video_path: str,
+    output_dir: str,
+    count: int = 5,
+    start_second: Optional[float] = None,
+    end_second: Optional[float] = None,
+) -> list[dict]:
+    """
+    Extract candidate frames with detected faces from a video.
+    Returns list of {path, face_x, face_y, face_w, face_h, confidence, timestamp}.
+
+    Scoring favors:
+    - High confidence (frontal, clear face)
+    - Sharp face region (eyes open, not blurry)
+    - Medium face size (natural portrait, not extreme close-up)
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return []
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    duration = total_frames / fps
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    is_portrait = src_h > src_w  # Already 9:16 or similar
+
+    # Load face detector
+    from services.face_detector import create_detector, detect_faces
+    detector = create_detector(src_w, src_h)
+
+    if detector is None:
+        cap.release()
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Sample frames in requested window (clip-local), otherwise use middle 80%.
+    if start_second is not None and end_second is not None and end_second > start_second:
+        start_t = max(0.0, float(start_second))
+        end_t = min(duration, float(end_second))
+        # Small in-window margin so we avoid hard boundary frames.
+        span = max(0.0, end_t - start_t)
+        margin = min(0.6, span * 0.08)
+        start_t = min(end_t, start_t + margin)
+        end_t = max(start_t, end_t - margin)
+    else:
+        start_t = duration * 0.1
+        end_t = duration * 0.9
+
+    if end_t - start_t < 0.2:
+        start_t = max(0.0, duration * 0.1)
+        end_t = min(duration, duration * 0.9)
+    sample_count = max(count * 10, 40)
+    candidates = []
+    best_rejected = None
+
+    for i in range(sample_count):
+        t = start_t + i * (end_t - start_t) / sample_count
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        h, w = frame.shape[:2]
+        faces_detected = detect_faces(detector, frame, src_w, src_h)
+
+        for f in faces_detected:
+            conf = f["confidence"]
+            x1 = max(0, f["cx"] - f["fw"] // 2)
+            y1 = max(0, f["cy"] - f["fh"] // 2)
+            x2 = min(w, f["cx"] + f["fw"] // 2)
+            y2 = min(h, f["cy"] + f["fh"] // 2)
+            fw = f["fw"]
+            fh = f["fh"]
+
+            if fw < w * 0.08:
+                continue
+
+            # Split-screen check: only for landscape sources where
+            # a small centered face likely means a multi-cam layout.
+            # Portrait sources naturally have centered faces.
+            face_cx = (x1 + x2) / 2
+            if not is_portrait and 0.4 * w < face_cx < 0.6 * w and fw < w * 0.15:
+                continue
+
+            face_score, sharpness, expression_quality = face_portrait_score(frame, x1, y1, x2, y2, conf)
+
+            mid_t = (start_t + end_t) / 2
+            span = max(0.1, end_t - start_t)
+            distance_from_mid = abs(t - mid_t) / (span / 2)
+            position_boost = 1.0 - 0.4 * min(1.0, distance_from_mid)
+
+            score = face_score * position_boost
+
+            entry = {
+                "frame": frame.copy(),
+                "timestamp": round(t, 1),
+                "confidence": round(float(conf), 3),
+                "face_x_pct": round((x1 + x2) / 2 / w * 100, 1),
+                "face_y_pct": round((y1 + y2) / 2 / h * 100, 1),
+                "face_w_pct": round(fw / w * 100, 1),
+                "face_h_pct": round(fh / h * 100, 1),
+                "sharpness": round(sharpness, 1),
+                "score": score,
+            }
+
+            if sharpness < SHARPNESS_FLOOR or expression_quality < EXPRESSION_FLOOR:
+                if best_rejected is None or score > best_rejected["score"]:
+                    best_rejected = entry
+                continue
+
+            candidates.append(entry)
+
+    cap.release()
+
+    if not candidates and best_rejected:
+        candidates.append(best_rejected)
+
+    if not candidates:
+        return []
+
+    # Pick top N by score, while enforcing diversity in both time and framing.
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    selected = []
+
+    def _too_similar(a: dict, b: dict) -> bool:
+        return (
+            abs(a["timestamp"] - b["timestamp"]) < 2.5
+            and abs(a["face_x_pct"] - b["face_x_pct"]) < 4.0
+            and abs(a["face_y_pct"] - b["face_y_pct"]) < 4.0
+            and abs(a["face_w_pct"] - b["face_w_pct"]) < 5.0
+        )
+
+    for c in candidates:
+        if len(selected) >= count:
+            break
+        too_close = any(abs(c["timestamp"] - s["timestamp"]) < 3 for s in selected)
+        too_similar = any(_too_similar(c, s) for s in selected)
+        if not too_close and not too_similar:
+            selected.append(c)
+
+    # If strict diversity rejected too much, relax time-only spacing to still
+    # fill requested variations while preserving different moments first.
+    if len(selected) < count:
+        for c in candidates:
+            if len(selected) >= count:
+                break
+            # Identity, not equality: these dicts hold a numpy frame, and
+            # comparing two of them raises rather than answering.
+            if any(c is s for s in selected):
+                continue
+            if any(_too_similar(c, s) for s in selected):
+                continue
+            selected.append(c)
+
+    # Detect split-screen: if all faces are in the left or right third,
+    # the video is likely a Riverside/multi-cam layout. Pre-crop to just
+    # the half containing the face.
+    if selected:
+        avg_face_x = sum(c["face_x_pct"] for c in selected) / len(selected)
+        is_split = avg_face_x < 35 or avg_face_x > 65
+
+        if is_split:
+            for c in selected:
+                h_frame, w_frame = c["frame"].shape[:2]
+                face_px = int(w_frame * c["face_x_pct"] / 100)
+                if avg_face_x < 35:
+                    c["frame"] = c["frame"][:, :w_frame // 2]
+                    new_w = w_frame // 2
+                    c["face_x_pct"] = round(face_px / new_w * 100, 1)
+                else:
+                    c["frame"] = c["frame"][:, w_frame // 2:]
+                    new_w = w_frame - w_frame // 2
+                    c["face_x_pct"] = round((face_px - w_frame // 2) / new_w * 100, 1)
+                c["face_w_pct"] = c["face_w_pct"] * 2
+            # After split crop, source is no longer portrait
+            is_portrait = False
+
+    # Crop/compose each frame to 9:16
+    target_ratio = 9 / 16  # 0.5625
+    target_w, target_h = 1080, 1920
+
+    for c in selected:
+        frame = c["frame"]
+        fh, fw = frame.shape[:2]
+        face_cx = int(fw * c["face_x_pct"] / 100)
+        face_cy = int(fh * c["face_y_pct"] / 100)
+        src_ratio = fw / fh
+
+        if is_portrait and src_ratio > 0.5:
+            # Already portrait (9:16 ish): scale to fit width, place face
+            # in upper portion with dark padding below for text area.
+            scale = target_w / fw
+            new_w = target_w
+            new_h = int(fh * scale)
+
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            face_cy_scaled = int(face_cy * scale)
+
+            # Place face at ~30% from top of the 1920px canvas
+            y_offset = int(target_h * 0.30) - face_cy_scaled
+            # Clamp: don't go above top, and keep as much of the frame visible
+            y_offset = max(0, min(y_offset, target_h - new_h))
+
+            # Compose onto dark canvas
+            canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            canvas[:] = (13, 13, 13)  # #0D0D0D in BGR
+            end_y = min(y_offset + new_h, target_h)
+            canvas[y_offset:end_y] = resized[:end_y - y_offset]
+
+            c["frame"] = canvas
+            c["face_x_pct"] = round(face_cx * scale / target_w * 100, 1)
+            c["face_y_pct"] = round((face_cy_scaled + y_offset) / target_h * 100, 1)
+        else:
+            crop_h = fh
+            crop_w = int(crop_h * target_ratio)
+            if crop_w > fw:
+                crop_w = fw
+                crop_h = int(crop_w / target_ratio)
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            tile_left, tile_right = _tile_bounds_for_face(gray, face_cx)
+            tile_w = tile_right - tile_left
+            if tile_w < crop_w:
+                crop_w = tile_w
+                crop_h = int(crop_w / target_ratio)
+
+            min_crop_w = int(fw * 0.3)
+            if crop_w < min_crop_w:
+                crop_w = min(min_crop_w, fw)
+                crop_h = int(crop_w / target_ratio)
+
+            crop_x = face_cx - crop_w // 2
+            if crop_w <= tile_w:
+                crop_x = max(tile_left, min(crop_x, tile_right - crop_w))
+            else:
+                crop_x = max(0, min(crop_x, fw - crop_w))
+
+            crop_y = face_cy - int(crop_h * 0.25)
+            crop_y = max(0, min(crop_y, fh - crop_h))
+
+            c["frame"] = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+            new_face_cx = face_cx - crop_x
+            new_face_cy = face_cy - crop_y
+            c["face_x_pct"] = round(new_face_cx / crop_w * 100, 1)
+            c["face_y_pct"] = round(new_face_cy / crop_h * 100, 1)
+
+    # Save frames
+    results = []
+    for i, c in enumerate(selected):
+        path = os.path.join(output_dir, f"frame_{i}.jpg")
+        frame = c["frame"]
+        fh, fw = frame.shape[:2]
+        if (fw, fh) != (target_w, target_h):
+            frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        # imwrite answers a failed write with False rather than raising, and a
+        # full disk is the usual reason. Listing the path regardless hands the
+        # renderer a frame that is not on disk, which it refuses.
+        if not cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+            log_event("thumbnail-ai", "could not write candidate frame",
+                      level="warn", path=path)
+            continue
+        results.append({
+            "path": path,
+            "timestamp": c["timestamp"],
+            "confidence": c["confidence"],
+            "face_x_pct": c["face_x_pct"],
+            "face_y_pct": c["face_y_pct"],
+            "face_w_pct": c["face_w_pct"],
+            "face_h_pct": c["face_h_pct"],
+        })
+
+    return results
+
+
+def _extract_json(text: str):
+    """Pull the first JSON value (object or array) out of a model's raw output."""
+    text = (text or "").strip()
+    spans = sorted(
+        (text.find(o), o, c) for o, c in (("[", "]"), ("{", "}")) if text.find(o) >= 0
+    )
+    for start, _open, close in spans:
+        end = text.rfind(close) + 1
+        if end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _ask_ai_for_json(prompt: str, timeout: int = 30):
+    """Run `prompt` through the AI provider chain, returning the first JSON value
+    it emits, or None if nothing is available or nothing returns parseable JSON."""
+    from services import ai_provider
+
+    parsed, result = ai_provider.generate_json(prompt, timeout=timeout)
+    if parsed is None:
+        log_event("thumbnail-ai", "ai request failed", level="warn",
+                  err=result.error, tried=", ".join(result.attempts))
+    return parsed
+
+
+def _thumbnail_kb_context() -> str:
+    from services.content_generator import load_kb_context
+
+    kb = load_kb_context([
+        ("07-thumbnail-guide.md", 2500),
+        ("02-voice-and-tone.md", 1500),
+        ("01-brand-identity.md", 800),
+    ])
+    if not kb:
+        return ""
+    return f"\nBRAND KNOWLEDGE BASE (follow its thumbnail text rules, voice, and banned words):\n{kb}\n"
+
+
+def _grounding_context(grounding: Optional[dict]) -> str:
+    """Format the clip's payoff/question/opening line for the headline prompt.
+
+    Without this, headline copy is rewritten from the title alone, a short
+    label that drifts from what the clip actually says. The clip's own
+    payoff and verbatim opening line keep the copy honest to the content.
+    """
+    if not grounding:
+        return ""
+    lines = []
+    if grounding.get("payoff"):
+        lines.append(f"Payoff (what the clip delivers): {grounding['payoff']}")
+    if grounding.get("context_line"):
+        lines.append(f"Question this clip answers: {grounding['context_line']}")
+    if grounding.get("preview_text"):
+        lines.append(f"Clip's verbatim opening line: {grounding['preview_text']}")
+    if not lines:
+        return ""
+    return "\nCLIP CONTENT (ground the headline in this, not just the title):\n" + "\n".join(lines) + "\n"
+
+
+def ask_claude_for_layout(
+    title: str,
+    frame_path: str,
+    frame_info: Optional[dict] = None,
+    logo_path: Optional[str] = None,
+    config: Optional[dict] = None,
+    variation: int = 0,
+    grounding: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Ask an available AI CLI to generate layout values for the thumbnail.
+    The model sees the frame info and decides everything dynamically.
+
+    Returns dict with line1, line2, box_y, photo_object_position, etc.
+    """
+    cfg = config or _load_brand_config()
+
+    face_ctx = "No face detected."
+    if frame_info:
+        face_ctx = (
+            f"Face center: x={frame_info.get('face_x_pct', 50)}%, y={frame_info.get('face_y_pct', 40)}%.\n"
+            f"Face size: {frame_info.get('face_w_pct', 20)}% width, {frame_info.get('face_h_pct', 25)}% height.\n"
+            f"The frame is already pre-cropped to 1080x1920 (9:16) with face centered horizontally."
+        )
+
+    prompt = f"""You are a thumbnail layout engine. Given a title and face position, return CSS values for a YouTube Shorts thumbnail (1080x1920).
+
+TITLE: "{title}"
+{_grounding_context(grounding)}{_thumbnail_kb_context()}
+PHOTO INFO:
+{face_ctx}
+
+Return ONLY valid JSON with these fields:
+{{
+  "line1": "FIRST LINE TEXT",
+  "line2": "SECOND LINE TEXT",
+  "box_y": "75%",
+  "photo_object_position": "center 20%",
+  "line1_font_size": "96px",
+  "line2_font_size": "90px"
+}}
+
+RULES:
+- Rewrite the title into thumbnail copy, not a literal transcript sentence. If clip content is given above, the copy must match what the clip actually delivers.
+- Split it into 2 impactful lines. Line 1 = setup, Line 2 = payoff.
+- Keep the combined copy to 4-8 words total whenever possible.
+- Keep each line short enough to fit comfortably on a Shorts thumbnail. Hard max: 24 characters per line.
+- Drop filler words and trailing clauses. Keep numbers, nouns, and the strongest claim.
+- box_y: position the text box so it does NOT overlap the face. If face is high (y<40%), use 80-85%. If face is centered (y~50%), use 75-78%. If face is low, use 68-72%.
+- photo_object_position: CSS value to show the face well. The photo is already 1080x1920 with face centered, so "center top" usually works. Adjust if face_y is unusual.
+- Font sizes: for short text (1-2 words per line) use 96-110px. For medium (3-4 words) use 80-96px. For long (5+ words) use 64-80px. Line 2 should be 85-95% of Line 1.
+- No slashes in the text lines.
+- This is thumbnail variation #{variation + 1}. Give a DISTINCT headline angle and wording from the most obvious phrasing. Vary the hook, the emphasis, or which idea you lead with so each variation reads differently."""
+
+    layout = _ask_ai_for_json(prompt, timeout=30)
+    return layout if isinstance(layout, dict) else None
+
+
+def generate_headline_variations(
+    title: str, n: int, config: Optional[dict] = None, grounding: Optional[dict] = None
+) -> list[tuple[str, str]]:
+    """Write n DISTINCT 2-line thumbnail headlines in a single AI call.
+
+    One call (rather than n independent layout calls) is both cheaper and the
+    only way to guarantee the variations actually differ, because the model has to see
+    all n at once to make them distinct. Returns [] if no AI CLI answers, letting
+    the caller fall back to per-variation layout.
+    """
+    prompt = f"""You are a thumbnail copywriter. Write {n} DISTINCT headline options for a YouTube Shorts thumbnail.
+
+TITLE: "{title}"
+{_grounding_context(grounding)}{_thumbnail_kb_context()}
+Return ONLY a JSON array of exactly {n} objects, each with "line1" and "line2":
+[{{"line1": "FIRST LINE", "line2": "SECOND LINE"}}, ...]
+
+RULES:
+- Rewrite the title into punchy thumbnail copy, not a literal transcript sentence. If clip content is given above, the copy must match what the clip actually delivers.
+- Line 1 = setup, Line 2 = payoff. 4-8 words total. Hard max 24 characters per line.
+- Drop filler words; keep numbers, nouns, and the strongest claim. No slashes.
+- Every option must read DIFFERENTLY: vary the hook, the emphasis, or which idea leads. Do not repeat the same phrasing across options."""
+
+    items = _ask_ai_for_json(prompt, timeout=45)
+    if not isinstance(items, list):
+        return []
+    return [
+        (str(it.get("line1", "")).strip(), str(it.get("line2", "")).strip())
+        for it in items
+        if isinstance(it, dict) and it.get("line1")
+    ]
+
+
+def generate_thumbnail_with_template(
+    title: str,
+    frame_path: str,
+    output_path: str,
+    logo_path: Optional[str] = None,
+    frame_info: Optional[dict] = None,
+    config: Optional[dict] = None,
+    variation: int = 0,
+    line1_override: Optional[str] = None,
+    line2_override: Optional[str] = None,
+    grounding: Optional[dict] = None,
+    people: Optional[list[dict]] = None,
+) -> Optional[str]:
+    """
+    Template + AI layout. Claude decides all dynamic values per frame.
+    Template provides consistent visual structure.
+
+    When line1_override is given, the two lines are used verbatim and the
+    Claude rewrite is skipped: the caller controls the exact split.
+    `people` carries the two panels of the pair layout from thumbnail_pair.
+    """
+    from services.thumbnail_html import generate_thumbnail, _load_config, _prepare_thumbnail_lines
+
+    cfg = _load_config()
+    if config:
+        cfg.update(config)
+
+    layout = None if line1_override is not None else ask_claude_for_layout(
+        title, frame_path, frame_info, logo_path, cfg, variation=variation, grounding=grounding
+    )
+
+    if line1_override is not None:
+        line1, line2 = _prepare_thumbnail_lines(
+            title=title, line1=line1_override, line2=line2_override or "",
+        )
+    elif layout:
+        line1, line2 = _prepare_thumbnail_lines(
+            title=title,
+            line1=layout.get("line1", title),
+            line2=layout.get("line2", ""),
+        )
+        # Apply Claude's CSS decisions to config
+        if layout.get("box_y"):
+            cfg["box_y"] = layout["box_y"]
+            cfg["box_y_with_photo"] = layout["box_y"]
+        if layout.get("photo_object_position"):
+            cfg["photo_object_position"] = layout["photo_object_position"]
+        if layout.get("line1_font_size"):
+            cfg["line1_font_size"] = layout["line1_font_size"]
+        if layout.get("line2_font_size"):
+            cfg["line2_font_size"] = layout["line2_font_size"]
+    else:
+        line1, line2 = _prepare_thumbnail_lines(title=title)
+
+    return generate_thumbnail(
+        line1, line2, output_path,
+        photo_path=frame_path if frame_path and os.path.exists(frame_path) else None,
+        logo_path=logo_path,
+        config=cfg,
+        variation=variation,
+        face_info=frame_info,
+        people=people,
+    )
+
+
+def resolve_pair(
+    cfg: dict,
+    output_dir: str,
+    video_path: Optional[str] = None,
+    start_second: Optional[float] = None,
+    end_second: Optional[float] = None,
+    layout: Optional[str] = None,
+    left_image: Optional[str] = None,
+    right_image: Optional[str] = None,
+    swap: bool = False,
+    face_map: Optional[dict] = None,
+    segments: Optional[list[dict]] = None,
+) -> Optional[dict]:
+    """The two-person panels when the pair layout is asked for, else None.
+
+    Asked for by `layout`, by the template's own layout, or by naming images
+    for both sides. The answer is thumbnail_pair's result, which says why when
+    it falls back to one face.
+    """
+    from services.thumbnail_html import _load_config, pair_panel_size
+    from services.thumbnail_pair import pick_pair
+
+    wanted = layout or cfg.get("layout") or "single"
+    if wanted != "pair" and not (left_image or right_image):
+        return None
+    sized = {**_load_config(), **cfg}
+    return pick_pair(
+        video_path, start_second, end_second,
+        os.path.join(output_dir, "_pair"), pair_panel_size(sized),
+        left_image=left_image, right_image=right_image, swap=swap,
+        face_map=face_map, segments=segments,
+    )
+
+
+def generate_variations(*args, **kwargs) -> list[str]:
+    """Generate thumbnail variations and return their paths. See render_variations."""
+    return render_variations(*args, **kwargs)["paths"]
+
+
+def render_variations(
+    title: str,
+    output_dir: str,
+    photo_path: Optional[str] = None,
+    video_path: Optional[str] = None,
+    start_second: Optional[float] = None,
+    end_second: Optional[float] = None,
+    logo_path: Optional[str] = None,
+    config: Optional[dict] = None,
+    line1: Optional[str] = None,
+    line2: Optional[str] = None,
+    grounding: Optional[dict] = None,
+    layout: Optional[str] = None,
+    left_image: Optional[str] = None,
+    right_image: Optional[str] = None,
+    swap: bool = False,
+    face_map: Optional[dict] = None,
+    segments: Optional[list[dict]] = None,
+) -> dict:
+    """
+    Generate thumbnail variations using AI.
+
+    1. Extract candidate frames from video (if no photo provided), or two
+       people's panels for the pair layout
+    2. For each variation, Claude generates the HTML layout
+    3. Playwright renders to PNG
+
+    Falls back to template-based generation if Claude is unavailable.
+    Returns {"paths": [...], "pair": thumbnail_pair's result or None}.
+    """
+    cfg = _load_brand_config()
+    if config:
+        cfg.update(config)
+
+    os.makedirs(output_dir, exist_ok=True)
+    n = cfg.get("variations", 3)
+
+    pair = resolve_pair(
+        cfg, output_dir, video_path, start_second, end_second, layout,
+        left_image, right_image, swap, face_map, segments,
+    )
+    people = pair["people"] if pair and pair["layout"] == "pair" else None
+    if pair and not people:
+        log_event("thumbnail-ai", "pair layout fell back to one face", reason=pair["reason"])
+
+    # Get frames
+    frames = []
+    if people:
+        frames = [{"path": None}]
+    elif photo_path and os.path.exists(photo_path):
+        frames = [{"path": photo_path}]
+    elif video_path:
+        frames_dir = os.path.join(output_dir, "_frames")
+        # Ask for extra candidates so each variation can use a distinct moment.
+        frames = extract_candidate_frames(
+            video_path,
+            frames_dir,
+            count=max(n + 2, n * 2),
+            start_second=start_second,
+            end_second=end_second,
+        )
+
+    if not frames and video_path and not people:
+        # Fallback: simpler face extraction with less aggressive filters
+        try:
+            from services.thumbnail_generator import extract_face_frame
+            fallback_path = os.path.join(output_dir, "_face_frame.png")
+            result = extract_face_frame(video_path, fallback_path,
+                                        target_width=cfg.get("width", 1080),
+                                        target_height=cfg.get("height", 1920),
+                                        start_second=start_second,
+                                        end_second=end_second)
+            if result:
+                frames = [result]
+        except Exception as exc:
+            log_warn("thumbnail", "frame extraction failed", error=exc)
+
+    if not frames:
+        frames = [{"path": None}]
+
+    # When the caller didn't pin exact copy, get n distinct headlines up front so
+    # the variations differ in wording: not just in frame/styling.
+    headlines: list[tuple[str, str]] = []
+    if line1 is None:
+        headlines = generate_headline_variations(title, n, config=cfg, grounding=grounding)
+
+    paths = []
+    for i in range(n):
+        frame = frames[i] if i < len(frames) else frames[i % len(frames)]
+        frame_path = frame.get("path") or ""
+        out_path = os.path.join(output_dir, f"thumb_v{i+1}.png")
+
+        v_line1, v_line2 = (line1, line2)
+        if headlines:
+            v_line1, v_line2 = headlines[i % len(headlines)]
+
+        result = generate_thumbnail_with_template(
+            title=title,
+            frame_path=frame_path,
+            output_path=out_path,
+            logo_path=logo_path,
+            frame_info=frame if frame_path else None,
+            config=cfg,
+            variation=i,
+            line1_override=v_line1,
+            line2_override=v_line2,
+            grounding=grounding,
+            people=people,
+        )
+
+        if result:
+            paths.append(result)
+
+    return {"paths": paths, "pair": pair}
+
+
+def thumbnail_to_video_frame(
+    thumbnail_path: str,
+    output_path: str,
+    duration: float = 0.8,
+    width: int = 1080,
+    height: int = 1920,
+) -> str:
+    """Convert thumbnail to a short video clip for appending.
+
+    Includes silent audio so concat_outro's acrossfade works.
+    No baked-in fades: crossfade handles the transition.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", thumbnail_path,
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-t", str(duration),
+        "-vf", (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+        ),
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        output_path,
+    ]
+    result = proc_run(cmd, timeout=120, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed: {result.stderr[-300:]}")
+    return output_path

@@ -1,0 +1,1 @@
+Make a 9:16 clip from [VIDEO] between [START] and [END]: the facecam on top, gameplay or main footage below, bold hook text at the top, word-by-word burned-in captions timed to the speech, loudness at -14 LUFS. Show me 5 frames from the result before you finish.

@@ -1,0 +1,1397 @@
+#!/usr/bin/env python3
+"""
+podcli: Python Backend Entry Point
+
+Reads a JSON task request from stdin, dispatches to the appropriate service,
+and writes a JSON result to stdout. Progress events go to stderr.
+"""
+
+import json
+import os
+from utils.log import warn as log_warn
+import sys
+
+# Windows streams default to cp1252; IPC is UTF-8. stdin matters as much as the
+# others: the task JSON arrives from Node, and a curly quote (U+201D) carries byte
+# 0x9D, which cp1252 leaves undefined, so decoding it raised UnicodeDecodeError
+# before the request was ever parsed.
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+# Load .env file (for HF_TOKEN, etc.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.environ.get("PODCLI_ENV_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
+except ImportError:
+    pass
+import threading
+import traceback
+from version import VERSION
+
+# Serializes event writes so parallel clip workers can't interleave JSON lines.
+_emit_lock = threading.Lock()
+
+
+def emit_progress(task_id: str, stage: str, percent: int, message: str, **extra):
+    """Write a progress event to stderr (picked up by TypeScript executor)."""
+    event = {
+        "task_id": task_id,
+        "stage": stage,
+        "percent": percent,
+        "message": message,
+    }
+    event.update(extra)
+    with _emit_lock:
+        print(json.dumps(event), file=sys.stderr, flush=True)
+
+
+def emit_result(task_id: str, status: str, data=None, error=None):
+    """Write the final result to stdout."""
+    result = {
+        "task_id": task_id,
+        "status": status,
+    }
+    if data is not None:
+        result["data"] = data
+    if error is not None:
+        result["error"] = error
+    with _emit_lock:
+        print(json.dumps(result), flush=True)
+
+
+def handle_ping(task_id: str, params: dict):
+    """Simple health check."""
+    emit_result(task_id, "success", data={"message": "pong", "version": VERSION})
+
+
+def handle_resolve_transcribe_engine(task_id: str, params: dict):
+    """Predict transcribe_file's engine resolution without transcribing, so
+    callers can build the right cache key before deciding whether to run it."""
+    from services.transcription import resolve_engine_info
+
+    emit_result(
+        task_id,
+        "success",
+        data=resolve_engine_info(params.get("engine"), params.get("model_size", "small")),
+    )
+
+
+def handle_transcribe(task_id: str, params: dict):
+    """Transcribe a podcast video/audio file with speaker detection."""
+    from services.transcription import transcribe_file
+    from services.corrections import apply_corrections
+    from services.transcript_packer import compute_cache_hash, cache_key_suffix, write_packed
+
+    emit_progress(task_id, "transcribing", 0, "Starting transcription...")
+    file_path = params["file_path"]
+    engine = params.get("engine")
+    model_size = params.get("model_size", "small")
+    language = params.get("language")
+    previous_engine = os.environ.get("PODCLI_ENGINE")
+    previous_assemblyai_key = os.environ.get("ASSEMBLYAI_API_KEY")
+    if engine:
+        os.environ["PODCLI_ENGINE"] = engine
+    if params.get("assemblyai_api_key"):
+        os.environ["ASSEMBLYAI_API_KEY"] = params["assemblyai_api_key"]
+
+    start_seconds = params.get("start_seconds")
+    duration_seconds = params.get("duration_seconds")
+    # Matches src/handlers/transcribe.handler.ts and web-server.ts exactly:
+    # a sample is a *positive* window, not merely a present key. A caller
+    # that explicitly passes null (dropped by JSON on the TS side, but
+    # still visible here as None) or duration_seconds: 0 must get the full
+    # transcription path, the same as not passing the field at all.
+    is_sample = (duration_seconds or 0) > 0 or (start_seconds or 0) > 0
+
+    # One shared 16 kHz mono wav feeds transcription, energy and reactions
+    # instead of decoding the source three times. Skipped for a sample run:
+    # transcribe_file extracts its own trimmed window, and decoding the full
+    # source here would undo the whole point of a quick sample.
+    shared_wav = None
+    if not is_sample:
+        try:
+            from services.audio_extract import extract_wav_16k_mono
+            shared_wav = extract_wav_16k_mono(file_path)
+        except Exception:
+            shared_wav = None
+
+    try:
+        result = transcribe_file(
+            file_path=file_path,
+            model_size=params.get("model_size", "small"),
+            engine=engine,
+            language=params.get("language"),
+            enable_diarization=params.get("enable_diarization", True),
+            num_speakers=params.get("num_speakers"),
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            progress_callback=lambda pct, msg: emit_progress(task_id, "transcribing", pct, msg),
+            wav_path=shared_wav,
+        )
+        # Apply word corrections (Whisper misheard proper nouns)
+        apply_corrections(result.get("words", []), result.get("segments", []))
+
+        # A sample is a throwaway language/quality check on a slice of the
+        # source. Energy/event signals and the packed view are keyed by the
+        # full file and meant to describe the whole episode, so skip them
+        # rather than caching partial (or source-wide-but-wrongly-expensive)
+        # data under those keys.
+        if not is_sample:
+            energy_data = None
+            try:
+                from services.audio_analyzer import extract_audio_energy
+                energy_data = extract_audio_energy(file_path, wav_path=shared_wav)
+            except Exception:
+                pass  # energy is a nice-to-have
+
+            events_data = None
+            try:
+                from services.audio_events import extract_audio_events
+                events_data = extract_audio_events(file_path, wav_path=shared_wav)
+            except Exception:
+                pass  # reactions are a nice-to-have
+
+            # Cached so clip suggestion reuses these instead of decoding the source again.
+            from services.signal_cache import save_signals
+            save_signals(file_path, energy_data=energy_data, events_data=events_data)
+
+            # Auto-pack: emit compact LLM-readable markdown alongside raw JSON.
+            # Pulls energy data so the packed view includes peak moments for clip reasoning.
+            try:
+                cache_hash = compute_cache_hash(file_path) + cache_key_suffix(
+                    engine=result.get("engine") or engine, model=result.get("model_size") or model_size, language=language
+                )
+                packed_path, packed_md = write_packed(
+                    result,
+                    cache_hash,
+                    source_label=os.path.basename(file_path),
+                    energy_data=energy_data,
+                    events_data=events_data,
+                )
+                result["packed_path"] = packed_path
+                result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
+            except Exception as e:
+                # Non-fatal: transcription result is still useful without the packed view
+                emit_progress(task_id, "packing", 99, f"Packer skipped: {e}")
+    finally:
+        if previous_engine is None:
+            os.environ.pop("PODCLI_ENGINE", None)
+        else:
+            os.environ["PODCLI_ENGINE"] = previous_engine
+        if previous_assemblyai_key is None:
+            os.environ.pop("ASSEMBLYAI_API_KEY", None)
+        else:
+            os.environ["ASSEMBLYAI_API_KEY"] = previous_assemblyai_key
+        if shared_wav and os.path.exists(shared_wav):
+            try:
+                os.unlink(shared_wav)
+            except OSError:
+                pass
+
+    emit_result(task_id, "success", data=result)
+
+
+def handle_create_clip(task_id: str, params: dict):
+    """Create a single finished short-form clip."""
+    from services.clip_generator import generate_clip
+    from services import asset_store
+
+    emit_progress(task_id, "starting", 0, "Preparing clip...")
+    result = generate_clip(
+        video_path=params["video_path"],
+        start_second=params["start_second"],
+        end_second=params["end_second"],
+        caption_style=params.get("caption_style", "hormozi"),
+        caption_position=params.get("caption_position", "auto"),
+        caption_font_scale=params.get("caption_font_scale", 100),
+        logo_position=params.get("logo_position", "top-left"),
+        topic=params.get("topic"),
+        progress=params.get("progress"),
+        cards=params.get("cards"),
+        brand=params.get("brand"),
+        font_family=params.get("font_family"),
+        crop_strategy=params.get("crop_strategy", "face"),
+        format=params.get("format", "vertical"),
+        crop_keyframes=params.get("crop_keyframes"),
+        transcript_words=params.get("transcript_words", []),
+        title=params.get("title", "clip"),
+        output_dir=params.get("output_dir"),
+        logo_path=asset_store.resolve(params.get("logo_path")),
+        outro_path=asset_store.resolve(params.get("outro_path")),
+        intro_path=asset_store.resolve(params.get("intro_path")),
+        name_card=params.get("name_card"),
+        motion=params.get("motion"),
+        bookend_fade=params.get("bookend_fade", 0.0),
+        clean_fillers=params.get("clean_fillers"),
+        face_map=params.get("face_map"),
+        keep_segments=params.get("keep_segments"),
+        hook=params.get("hook"),
+        trim_opening=params.get("trim_opening"),
+        preserve_timing=params.get("preserve_timing", False),
+        allow_ass_fallback=params.get("allow_ass_fallback", False),
+        use_ass_captions=params.get("use_ass_captions", False),
+        keep_caption_overlay=params.get("keep_caption_overlay", False),
+        write_clean_variant=params.get("write_clean_variant", False),
+        progress_callback=lambda pct, msg: emit_progress(task_id, "processing", pct, msg),
+    )
+    emit_result(task_id, "success", data=result)
+
+
+def _render_concurrency() -> int:
+    raw = (os.environ.get("PODCLI_RENDER_CONCURRENCY") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 2 if (os.cpu_count() or 1) >= 8 else 1
+
+
+def handle_batch_clips(task_id: str, params: dict):
+    """Create multiple clips with a bounded worker pool."""
+    from concurrent.futures import ThreadPoolExecutor
+    from services.clip_generator import generate_clip
+    from services import asset_store
+
+    clips = params["clips"]
+    total = len(clips)
+    results = [None] * total
+    completed = 0
+    completed_lock = threading.Lock()
+
+    def render_one(i: int, clip: dict) -> dict:
+        emit_progress(
+            task_id,
+            "batch",
+            int((i / total) * 100),
+            f"Processing clip {i + 1}/{total}...",
+        )
+        result = generate_clip(
+            video_path=params["video_path"],
+            start_second=clip["start_second"],
+            end_second=clip["end_second"],
+            caption_style=clip.get("caption_style", "hormozi"),
+            caption_position=clip.get("caption_position", params.get("caption_position", "auto")),
+            caption_font_scale=clip.get("caption_font_scale", params.get("caption_font_scale", 100)),
+            logo_position=clip.get("logo_position", params.get("logo_position", "top-left")),
+            topic=clip.get("topic", params.get("topic")),
+            progress=clip.get("progress", params.get("progress")),
+            cards=clip.get("cards", params.get("cards")),
+            brand=clip.get("brand", params.get("brand")),
+            font_family=clip.get("font_family", params.get("font_family")),
+            crop_strategy=clip.get("crop_strategy", "face"),
+            format=clip.get("format", params.get("format", "vertical")),
+            transcript_words=params.get("transcript_words", []),
+            title=clip.get("title", f"clip_{i + 1}"),
+            output_dir=params.get("output_dir"),
+            logo_path=asset_store.resolve(clip.get("logo_path") or params.get("logo_path")),
+            outro_path=asset_store.resolve(params.get("outro_path")),
+            intro_path=asset_store.resolve(clip.get("intro_path") or params.get("intro_path")),
+            name_card=clip.get("name_card") or params.get("name_card"),
+            motion=clip.get("motion") or params.get("motion"),
+            bookend_fade=params.get("bookend_fade", 0.0),
+            clean_fillers=params.get("clean_fillers"),
+            face_map=params.get("face_map"),
+            keep_segments=clip.get("keep_segments"),
+            hook=clip.get("hook"),
+            allow_ass_fallback=clip.get("allow_ass_fallback", params.get("allow_ass_fallback", False)),
+            use_ass_captions=clip.get("use_ass_captions", params.get("use_ass_captions", False)),
+            keep_caption_overlay=clip.get(
+                "keep_caption_overlay", params.get("keep_caption_overlay", False)
+            ),
+            write_clean_variant=clip.get(
+                "write_clean_variant", params.get("write_clean_variant", False)
+            ),
+            progress_callback=lambda pct, msg, _i=i: emit_progress(
+                task_id, "batch", int((_i / total) * 100 + pct / total), msg
+            ),
+        )
+        return {
+            "clip_index": i,
+            "status": "success",
+            "start_second": clip["start_second"],
+            "end_second": clip["end_second"],
+            **result,
+        }
+
+    def run_and_record(i: int, clip: dict) -> None:
+        nonlocal completed
+        try:
+            row = results[i] = render_one(i, clip)
+            message = f"Clip {i + 1}/{total} complete"
+        except Exception as e:
+            row = results[i] = {
+                "clip_index": i,
+                "status": "error",
+                "start_second": clip.get("start_second"),
+                "end_second": clip.get("end_second"),
+                "error": str(e),
+            }
+            message = f"Clip {i + 1}/{total} failed"
+        with completed_lock:
+            completed += 1
+            done = completed
+        emit_progress(
+            task_id,
+            "clip_complete",
+            int((done / total) * 100),
+            message,
+            clip_result=row,
+        )
+
+    workers = min(_render_concurrency(), max(1, total))
+    if workers <= 1:
+        for i, clip in enumerate(clips):
+            run_and_record(i, clip)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(run_and_record, i, clip) for i, clip in enumerate(clips)]
+            for f in futures:
+                f.result()
+
+    emit_result(
+        task_id,
+        "success",
+        data={
+            "results": results,
+            "total_clips": total,
+            "successful_clips": sum(1 for r in results if r and r["status"] == "success"),
+        },
+    )
+
+
+def handle_parse_transcript(task_id: str, params: dict):
+    """Parse a speaker-labeled transcript into word-level timestamps."""
+    import hashlib
+    from services.transcript_parser import detect_and_parse
+    from services.corrections import apply_corrections
+    from services.transcript_packer import write_packed
+
+    raw_text = params.get("raw_text", "")
+    total_duration = params.get("total_duration")
+    time_adjust = params.get("time_adjust", 0.0)
+    language = params.get("language")
+
+    if not raw_text:
+        emit_result(task_id, "error", error="raw_text is required")
+        return
+
+    emit_progress(task_id, "parsing", 50, "Parsing transcript...")
+    result = detect_and_parse(
+        raw_text, total_duration=total_duration, time_adjust=time_adjust, language=language
+    )
+
+    if "error" in result:
+        emit_result(task_id, "error", error=result["error"])
+        return
+
+    # Apply word corrections (proper nouns, brand names)
+    apply_corrections(result.get("words", []), result.get("segments", []))
+
+    # Auto-pack: key pasted transcripts by content hash since there's no source file.
+    try:
+        content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
+        packed_path, packed_md = write_packed(
+            result, content_hash, source_label="pasted-transcript"
+        )
+        result["packed_path"] = packed_path
+        result["packed_size_bytes"] = len(packed_md.encode("utf-8"))
+        result["content_hash"] = content_hash
+    except Exception as e:
+        emit_progress(task_id, "packing", 99, f"Packer skipped: {e}")
+
+    emit_progress(task_id, "parsing", 100, "Transcript parsed!")
+    emit_result(task_id, "success", data=result)
+
+
+def handle_pack_transcript(task_id: str, params: dict):
+    """Pack a transcript dict into LLM-readable markdown. Used to backfill
+    the packed view for caches that predate auto-packing."""
+    from services.transcript_packer import write_packed
+
+    transcript = params.get("transcript")
+    cache_hash = params.get("cache_hash")
+    if not transcript or not cache_hash:
+        emit_result(task_id, "error", error="transcript and cache_hash are required")
+        return
+
+    energy_data = params.get("energy_data")
+    events_data = params.get("events_data")
+    if params.get("file_path"):
+        if energy_data is None:
+            try:
+                from services.audio_analyzer import extract_audio_energy
+                energy_data = extract_audio_energy(params["file_path"])
+            except Exception as exc:
+                log_warn("main", "audio energy extraction failed", error=exc)
+        if events_data is None:
+            try:
+                from services.audio_events import extract_audio_events
+                events_data = extract_audio_events(params["file_path"])
+            except Exception as exc:
+                log_warn("main", "audio event extraction failed", error=exc)
+
+    path, md = write_packed(
+        transcript,
+        cache_hash,
+        source_label=params.get("source_label"),
+        energy_data=energy_data,
+        events_data=events_data,
+    )
+    emit_result(task_id, "success", data={
+        "packed_path": path,
+        "size_bytes": len(md.encode("utf-8")),
+    })
+
+
+def handle_analyze_energy(task_id: str, params: dict):
+    """Analyze audio energy of a video to improve clip scoring."""
+    from services.audio_analyzer import get_energy_profile
+
+    video_path = params.get("video_path", "")
+    segments = params.get("segments", [])
+
+    if not video_path:
+        emit_result(task_id, "error", error="video_path is required")
+        return
+
+    result = get_energy_profile(
+        video_path=video_path,
+        segments=segments,
+        progress_callback=lambda pct, msg: emit_progress(task_id, "analyzing", pct, msg),
+    )
+    emit_result(task_id, "success", data=result)
+
+
+def handle_detect_highlights(task_id: str, params: dict):
+    """Detect highlight clips from a video's fused signal curve (party/action profiles).
+
+    Accepts a single `video_path`, or a list of `video_paths` to pool and rank
+    highlights across a whole folder of clips.
+    """
+    from services.saliency import detect_highlights, detect_highlights_pooled
+
+    video_paths = params.get("video_paths")
+    video_path = params.get("video_path", "")
+    if not video_paths and not video_path:
+        emit_result(task_id, "error", error="video_path or video_paths is required")
+        return
+
+    common = dict(
+        profile_name=params.get("profile", "party"),
+        min_dur=float(params.get("min_dur", 8.0)),
+        max_dur=float(params.get("max_dur", 60.0)),
+        progress_callback=lambda pct, msg: emit_progress(task_id, "detecting", pct, msg),
+    )
+    if video_paths:
+        clips = detect_highlights_pooled(
+            video_paths=video_paths, top_n=int(params.get("top_n", 15)), **common
+        )
+    else:
+        clips = detect_highlights(
+            video_path=video_path, top_n=int(params.get("top_n", 8)), **common
+        )
+    emit_result(task_id, "success", data={"clips": clips, "count": len(clips)})
+
+
+def handle_manage_reel(task_id: str, params: dict):
+    """Create and iterate on a highlights reel: the MCP surface over the reel service.
+
+    Actions: new (detect + build), list, show, edit (adjust one moment + rebuild),
+    build, delete.
+    """
+    import hashlib
+    from dataclasses import asdict
+    from services.reel import (
+        ReelSession, seed_session, seed_session_pooled, edit_moment, build_reel,
+        list_sessions, delete_session,
+    )
+
+    action = params.get("action", "show")
+
+    def payload(session, reel=None):
+        moments = []
+        for i, m in enumerate(session.moments, 1):
+            d = asdict(m)
+            d["clip_path"] = os.path.join(session.out_dir, "clips", f"clip_{i:02d}.mp4")
+            d["clip_exists"] = os.path.exists(d["clip_path"])
+            moments.append(d)
+        reel_file = reel or os.path.join(session.out_dir, "highlights_reel.mp4")
+        sources = sorted({m.source for m in session.moments if m.source}) or [session.source]
+        return {
+            "session_id": session.session_id,
+            "source": session.source,
+            "sources": sources,
+            "format": session.format,
+            "logo": session.logo,
+            "out_dir": session.out_dir,
+            "reel_path": reel_file if os.path.exists(reel_file) else None,
+            "moments": moments,
+        }
+
+    try:
+        if action == "new":
+            from services.transcript_packer import compute_cache_hash, load_cached_transcript_for_video
+            import cli as cli_mod
+            video_paths = params.get("video_paths") or []
+            # Auto lets the saliency threshold decide how many moments clear the bar,
+            # capped for sanity, with a wide length range so windows aren't constrained.
+            auto = bool(params.get("auto"))
+            from services import asset_store
+            common = dict(
+                profile=params.get("profile", "auto"),
+                format=params.get("format", "horizontal"),
+                top_n=50 if auto else int(params.get("top_n", 10)),
+                min_dur=5.0 if auto else float(params.get("min_dur", 15.0)),
+                max_dur=120.0 if auto else float(params.get("max_dur", 60.0)),
+                logo=params.get("logo") or asset_store.default_logo() or "",
+                progress_callback=lambda p, m: emit_progress(task_id, "detecting", p, m),
+            )
+            if video_paths:
+                sid = hashlib.sha256("\n".join(sorted(video_paths)).encode()).hexdigest()[:16]
+                out_dir = params.get("out_dir") or os.path.join(os.getcwd(), f"reel_{sid[:8]}")
+                session = seed_session_pooled(sid, video_paths, out_dir, **common)
+            else:
+                video = params["video_path"]
+                sid = compute_cache_hash(video)
+                out_dir = params.get("out_dir") or os.path.join(os.getcwd(), f"reel_{sid[:8]}")
+                cached = load_cached_transcript_for_video(video, engine=cli_mod._transcript_cache_engine())
+                words = cached.get("words") if cached else None
+                session = seed_session(sid, video, out_dir, words=words, **common)
+            reel = build_reel(session, progress_callback=lambda p, m: emit_progress(task_id, "building", p, m))
+            emit_result(task_id, "success", data=payload(session, reel))
+        elif action == "list":
+            emit_result(task_id, "success", data={"sessions": list_sessions()})
+        elif action == "delete":
+            ok = delete_session(params["session_id"])
+            emit_result(task_id, "success", data={"deleted": ok, "session_id": params["session_id"]})
+        elif action == "show":
+            emit_result(task_id, "success", data=payload(ReelSession.load(params["session_id"])))
+        elif action == "edit":
+            session = edit_moment(
+                ReelSession.load(params["session_id"]),
+                int(params["index"]), params["op"], float(params.get("seconds", 0.0)),
+                start=params.get("start"), end=params.get("end"),
+            )
+            reel = build_reel(session, progress_callback=lambda p, m: emit_progress(task_id, "building", p, m))
+            emit_result(task_id, "success", data=payload(session, reel))
+        elif action == "build":
+            session = ReelSession.load(params["session_id"])
+            if "logo" in params:
+                session.logo = params.get("logo") or ""
+                for mm in session.moments:
+                    mm.dirty = True
+            reel = build_reel(session, progress_callback=lambda p, m: emit_progress(task_id, "building", p, m))
+            emit_result(task_id, "success", data=payload(session, reel))
+        else:
+            emit_result(task_id, "error", error=f"unknown reel action {action!r}")
+    except (KeyError, IndexError, ValueError, FileNotFoundError) as e:
+        emit_result(task_id, "error", error=str(e))
+
+
+def handle_detect_encoder(task_id: str, params: dict):
+    """Detect available hardware encoders."""
+    from services.encoder import get_encoder_info
+    emit_result(task_id, "success", data=get_encoder_info())
+
+
+def handle_presets(task_id: str, params: dict):
+    """Manage presets (list, get, save, delete)."""
+    from presets import list_presets, get_preset, save_preset, delete_preset
+
+    action = params.get("action", "list")
+    name = params.get("name", "default")
+
+    if action == "list":
+        emit_result(task_id, "success", data={"presets": list_presets()})
+    elif action in ("get", "load"):  # MCP manage_presets uses "load"
+        try:
+            preset = get_preset(name)
+            emit_result(task_id, "success", data={"config": preset, "name": name})
+        except FileNotFoundError as e:
+            emit_result(task_id, "error", error=str(e))
+    elif action == "save":
+        config = params.get("config", {})
+        path = save_preset(name, config)
+        emit_result(task_id, "success", data={"path": path, "name": name})
+    elif action == "delete":
+        ok = delete_preset(name)
+        emit_result(task_id, "success", data={"deleted": ok})
+    else:
+        emit_result(task_id, "error", error=f"Unknown presets action: {action}")
+
+
+def handle_corrections(task_id: str, params: dict):
+    """Manage transcript word corrections (get, set, add, remove)."""
+    from services.corrections import get_corrections, save_corrections
+
+    action = params.get("action", "get")
+
+    if action == "get":
+        emit_result(task_id, "success", data={"corrections": get_corrections()})
+    elif action == "set":
+        corrections = params.get("corrections", {})
+        path = save_corrections(corrections)
+        emit_result(task_id, "success", data={"corrections": corrections, "path": path})
+    elif action == "add":
+        wrong = params.get("wrong", "")
+        correct = params.get("correct", "")
+        if not wrong or not correct:
+            emit_result(task_id, "error", error="'wrong' and 'correct' are required")
+            return
+        current = get_corrections()
+        current[wrong] = correct
+        save_corrections(current)
+        emit_result(task_id, "success", data={"corrections": current})
+    elif action == "remove":
+        wrong = params.get("wrong", "")
+        current = get_corrections()
+        current.pop(wrong, None)
+        save_corrections(current)
+        emit_result(task_id, "success", data={"corrections": current})
+    else:
+        emit_result(task_id, "error", error=f"Unknown corrections action: {action}")
+
+
+def _extract_signals(
+    task_id: str,
+    video_path: str,
+    want_energy: bool,
+    want_events: bool,
+) -> tuple[list | None, list | None]:
+    """Decode the source once and derive whichever profiles aren't cached yet."""
+    from services.audio_events import is_available as audio_events_available
+
+    want_events = want_events and audio_events_available()
+    if not want_energy and not want_events:
+        return None, None
+
+    wav_path = None
+    try:
+        from services.audio_extract import extract_wav_16k_mono
+        emit_progress(task_id, "suggesting", 2, "Extracting audio...")
+        wav_path = extract_wav_16k_mono(video_path)
+    except Exception:
+        wav_path = None
+
+    energy_data = None
+    events_data = None
+    try:
+        if want_energy:
+            emit_progress(task_id, "suggesting", 5, "Analyzing audio energy...")
+            try:
+                from services.audio_analyzer import extract_audio_energy
+                energy_data = extract_audio_energy(video_path, wav_path=wav_path)
+            except Exception:
+                pass  # energy is a nice-to-have
+        if want_events:
+            emit_progress(task_id, "suggesting", 15, "Detecting laughter and reactions...")
+            try:
+                from services.audio_events import extract_audio_events
+                events_data = extract_audio_events(video_path, wav_path=wav_path)
+            except Exception:
+                pass  # reactions are a nice-to-have
+    finally:
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+    return energy_data, events_data
+
+
+def _signal_profiles_for_suggest(
+    task_id: str,
+    params: dict,
+) -> tuple[list | None, list | None, list | None]:
+    """Energy and reaction profiles for the suggester: caller-supplied first, then
+    what transcription cached for this video, and only then a fresh analysis."""
+    from services.audio_events import reaction_times as reaction_times_from_events
+    from services.signal_cache import load_signals, save_signals
+
+    energy_data = params.get("energy_data")
+    events_data = params.get("events_data")
+    anchors = params.get("reaction_times")
+    if anchors is not None:
+        anchors = [float(t) for t in anchors]
+
+    video_path = params.get("video_path")
+    if video_path and os.path.exists(video_path) and (energy_data is None or events_data is None):
+        cached = load_signals(video_path)
+        if energy_data is None:
+            energy_data = cached.get("energy_data")
+        if events_data is None:
+            events_data = cached.get("events_data")
+
+        if energy_data is None or events_data is None:
+            fresh_energy, fresh_events = _extract_signals(
+                task_id,
+                video_path,
+                want_energy=energy_data is None,
+                want_events=events_data is None,
+            )
+            save_signals(video_path, energy_data=fresh_energy, events_data=fresh_events)
+            energy_data = energy_data if energy_data is not None else fresh_energy
+            events_data = events_data if events_data is not None else fresh_events
+
+    if anchors is None and events_data:
+        anchors = reaction_times_from_events(events_data)
+
+    return energy_data, events_data, anchors
+
+
+def handle_suggest_clips(task_id: str, params: dict):
+    """AI-powered clip suggestion using Claude/Codex and PodStack knowledge base."""
+    from services import ai_provider
+    from services.claude_suggest import (
+        ClipBounds,
+        drop_published,
+        select_clips_with_signal_scores,
+        suggest_initial_with_claude,
+    )
+
+    segments = params.get("segments", [])
+    top_n = params.get("top_n", 5)
+    existing_clips = params.get("existing_clips", [])
+    bounds = ClipBounds.of(
+        params.get("format"),
+        params.get("min_duration"),
+        params.get("max_duration"),
+    )
+
+    if not segments:
+        emit_result(task_id, "error", error="segments is required")
+        return
+
+    # Gate on the provider chain, not on a local binary: a signed-in Pro user
+    # has AI available without installing anything.
+    if not ai_provider.available():
+        emit_result(
+            task_id,
+            "error",
+            error=(
+                "No AI available. Sign in with `podcli login`, install Claude Code "
+                "or Codex, or set ANTHROPIC_API_KEY."
+            ),
+        )
+        return
+
+    errors: list[str] = []
+    energy_data, events_data, reaction_times = _signal_profiles_for_suggest(task_id, params)
+    candidate_top_n = top_n * 2
+    clips = suggest_initial_with_claude(
+        segments=segments,
+        top_n=candidate_top_n,
+        exclude_clips=existing_clips,
+        progress_callback=lambda pct, msg: emit_progress(task_id, "suggesting", pct, msg),
+        error_sink=errors,
+        reaction_times=reaction_times,
+        bounds=bounds,
+    )
+
+    if clips is None:
+        detail = errors[-1] if errors else "check claude/codex login and try again"
+        emit_result(task_id, "error", error=detail)
+        return
+
+    clips = select_clips_with_signal_scores(
+        clips,
+        top_n=top_n,
+        energy_data=energy_data,
+        events_data=events_data,
+        progress_callback=lambda pct, msg: emit_progress(task_id, "suggesting", pct, msg),
+    )
+    emit_result(task_id, "success", data={"clips": drop_published(clips)})
+
+
+def handle_rank_candidates(task_id: str, params: dict):
+    """Sentence-aligned heuristic ranking. Returns a shortlist, not the transcript."""
+    from services.transcript_packer import load_cached_transcript_for_video
+    import cli as cli_mod
+
+    segments = params.get("segments") or []
+    video_path = params.get("video_path")
+    if not segments:
+        if not video_path:
+            emit_result(task_id, "error", error="video_path or segments is required")
+            return
+        cached = load_cached_transcript_for_video(video_path, engine=cli_mod._transcript_cache_engine())
+        if not cached:
+            emit_result(
+                task_id,
+                "error",
+                error="No transcript cached for this video. Call transcribe_podcast first.",
+            )
+            return
+        segments = cached.get("segments") or []
+    if not segments:
+        emit_result(task_id, "error", error="Transcript has no segments to rank")
+        return
+
+    top_n = int(params.get("top_n") or 20)
+    top_n = max(1, min(top_n, 40))
+    emit_progress(task_id, "ranking", 10, f"Ranking up to {top_n} sentence-aligned candidates...")
+    clips = cli_mod._suggest_clips(segments=segments, top_n=top_n)
+    candidates = []
+    for i, clip in enumerate(clips):
+        preview = clip.get("preview") or clip.get("preview_text") or clip.get("quote") or ""
+        candidates.append({
+            "rank": i + 1,
+            "start_second": clip.get("start_second"),
+            "end_second": clip.get("end_second"),
+            "duration": clip.get("duration"),
+            "score": clip.get("score"),
+            "title": clip.get("title"),
+            "preview": str(preview)[:180],
+            "reasons": clip.get("reasons") or [],
+        })
+    emit_result(task_id, "success", data={"count": len(candidates), "candidates": candidates})
+
+
+def handle_process_episode(task_id: str, params: dict):
+    """Run `process` non-interactively and return the --json payload."""
+    import argparse
+    import io
+    import cli as cli_mod
+
+    video_path = params.get("video_path") or params.get("file_path")
+    if not video_path:
+        emit_result(task_id, "error", error="video_path is required")
+        return
+    emit_progress(task_id, "process", 1, "Processing episode...")
+    args = argparse.Namespace(
+        video=video_path,
+        transcript=params.get("transcript"),
+        top=params.get("top") or params.get("top_n"),
+        output=params.get("output"),
+        preset=params.get("preset"),
+        engine=params.get("engine"),
+        assemblyai_api_key=params.get("assemblyai_api_key"),
+        fast=bool(params.get("fast")),
+        thumbnails=params.get("thumbnails"),
+        caption_style=params.get("caption_style"),
+        crop=params.get("crop"),
+        format=params.get("format"),
+        profile=params.get("profile"),
+        logo=params.get("logo"),
+        outro=params.get("outro"),
+        no_outro=bool(params.get("no_outro", False)),
+        intro=params.get("intro"),
+        time_adjust=params.get("time_adjust"),
+        no_energy=bool(params.get("no_energy", False)),
+        no_speakers=bool(params.get("no_speakers", False)),
+        no_cache=bool(params.get("no_cache", False)),
+        no_resume=bool(params.get("no_resume", False)),
+        quality=params.get("quality"),
+        allow_ass_fallback=bool(params.get("allow_ass_fallback", False)),
+        review_each=False,
+        post_review=False,
+        json=True,
+        yes=True,
+        quiet=True,
+        no_banner=True,
+        cloud=False,
+        language=params.get("language"),
+        template=None,
+        caption_position=None,
+        caption_scale=None,
+        face_map=None,
+        crop_keyframes=None,
+        thumbnail_placement=None,
+        logo_position=None,
+        logo_scale=None,
+        topic=None,
+        progress=False,
+        progress_color=None,
+        brand=None,
+        style=None,
+        font_family=None,
+        name_card=None,
+        motion=None,
+        bookend_fade=None,
+    )
+    buf = io.StringIO()
+    old_out = sys.stdout
+    try:
+        sys.stdout = buf
+        cli_mod.cmd_process(args)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        if code not in (0, None):
+            emit_result(task_id, "error", error=f"process exited {code}")
+            return
+    finally:
+        sys.stdout = old_out
+
+    raw = buf.getvalue().strip()
+    payload = None
+    for line in reversed(raw.splitlines() or [""]):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if payload is None:
+        emit_result(task_id, "error", error="process finished without a JSON result")
+        return
+    emit_result(task_id, "success", data=payload)
+
+
+def handle_manage_env(task_id: str, params: dict):
+    """List/set/unset user secrets in the global .env (e.g. HF_TOKEN)."""
+    from services.env_settings import run_env_action
+
+    try:
+        data = run_env_action(params.get("action", "list"), params.get("key"), params.get("value"))
+    except ValueError as e:
+        emit_result(task_id, "error", error=str(e))
+        return
+    emit_result(task_id, "success", data=data)
+
+
+def handle_ai_cli_status(task_id: str, params: dict):
+    from services.ai_cli import get_ai_cli_status
+
+    emit_result(task_id, "success", data=get_ai_cli_status())
+
+
+def handle_ai_provider_status(task_id: str, params: dict):
+    """Everything podcli can use for AI, not just local binaries, so the studio
+    can tell "nothing installed" apart from "signed in, nothing needed"."""
+    from services import ai_provider
+
+    emit_result(task_id, "success", data=ai_provider.status())
+
+
+def handle_find_moment(task_id: str, params: dict):
+    """Locate user-pasted/described moments in the transcript via the AI CLI."""
+    from services.claude_suggest import find_moments_from_text
+
+    text = (params.get("text") or params.get("description") or "").strip()
+    segments = params.get("segments", [])
+    existing_clips = params.get("existing_clips", [])
+    max_results = params.get("max_results", 8)
+
+    if not text:
+        emit_result(task_id, "error", error="text is required")
+        return
+    if not segments:
+        emit_result(task_id, "error", error="segments is required")
+        return
+
+    clips = find_moments_from_text(
+        text,
+        segments,
+        existing_clips,
+        progress_callback=lambda pct, msg: emit_progress(task_id, "searching", pct, msg),
+        max_results=max_results,
+    )
+    emit_result(task_id, "success", data={"clips": clips})
+
+
+def handle_generate_content(task_id: str, params: dict):
+    """Generate titles, descriptions, tags for a clip using PodStack knowledge base."""
+    from services.content_generator import generate_clip_content
+    from services import ai_provider
+
+    clip = params.get("clip", {})
+    transcript_segments = params.get("transcript_segments", [])
+
+    if not clip:
+        emit_result(task_id, "error", error="clip is required")
+        return
+
+    # Gate on the provider chain, not on a local binary: a signed-in Pro user
+    # has AI available without installing anything.
+    if not ai_provider.available():
+        emit_result(
+            task_id,
+            "error",
+            error=(
+                "No AI available. Sign in with `podcli login`, install Claude Code "
+                "or Codex, or set ANTHROPIC_API_KEY."
+            ),
+        )
+        return
+
+    result = generate_clip_content(
+        clip=clip,
+        transcript_segments=transcript_segments,
+        progress_callback=lambda pct, msg: emit_progress(task_id, "generating", pct, msg),
+        mode=params.get("mode", "shorts"),
+        partial_callback=lambda partial: emit_progress(
+            task_id, "generating", 60, "Writing content...", partial=partial
+        ),
+    )
+
+    if result is None:
+        emit_result(
+            task_id,
+            "error",
+            error="Content generation failed: check that your AI provider is reachable and try again",
+        )
+        return
+
+    emit_result(task_id, "success", data=result)
+
+
+def handle_generate_custom(task_id: str, params: dict):
+    """Run a free-form content request against the AI CLI with KB + transcript context."""
+    from services.content_generator import generate_custom_content
+
+    instruction = str(params.get("instruction", "")).strip()
+    if not instruction:
+        emit_result(task_id, "error", error="instruction is required")
+        return
+
+    result = generate_custom_content(
+        instruction=instruction,
+        transcript_segments=params.get("transcript_segments", []),
+        mode=params.get("mode", "shorts"),
+        progress_callback=lambda pct, msg: emit_progress(task_id, "generating", pct, msg),
+    )
+
+    if result is None:
+        # The gate above admits a workspace session or an API key as well as a
+        # local binary, so naming only the binary sends cloud users to install
+        # something they will never use.
+        emit_result(task_id, "error", error="No AI provider available: sign in to podcli Pro, install Claude Code or Codex, or set ANTHROPIC_API_KEY")
+        return
+
+    emit_result(task_id, "success", data=result)
+
+
+def handle_manage_integrations(task_id: str, params: dict):
+    from services.integrations import IntegrationsManager
+
+    manager = IntegrationsManager()
+    action = params.get("action", "list")
+
+    if action == "list":
+        emit_result(task_id, "success", data={"integrations": manager.list_all()})
+        return
+
+    name = params.get("name", "")
+    if action in ("enable", "disable"):
+        try:
+            manager.set_enabled(name, action == "enable")
+            emit_result(task_id, "success", data={"name": name, "enabled": action == "enable"})
+        except ValueError as e:
+            emit_result(task_id, "error", error=str(e))
+        return
+
+    emit_result(task_id, "error", error=f"Unknown action: {action}")
+
+
+def handle_manage_config(task_id: str, params: dict):
+    from config_bundle import run_config_action
+
+    try:
+        data = run_config_action(
+            params.get("action", "status"),
+            bundle_path=params.get("bundle_path") or params.get("bundle"),
+            home=params.get("home"),
+            activate=bool(params.get("activate", False)),
+            dry_run=bool(params.get("dry_run", False)),
+        )
+        emit_result(task_id, "success", data=data)
+    except ValueError as e:
+        emit_result(task_id, "error", error=str(e))
+
+
+def handle_analyze_silence(task_id: str, params: dict):
+    """Analyze a full episode locally and return a conservative cut plan."""
+    from services.silence_removal import analyze_silence
+
+    try:
+        result = analyze_silence(
+            video_path=params.get("video_path", ""),
+            transcript_words=params.get("transcript_words") or [],
+            threshold=float(params.get("threshold", 0.5)),
+            min_silence_seconds=float(params.get("min_silence_seconds", 0.65)),
+            padding_seconds=float(params.get("padding_seconds", 0.12)),
+            progress_callback=lambda pct, msg: emit_progress(
+                task_id, "silence_analysis", pct, msg
+            ),
+        )
+        emit_result(task_id, "success", data=result)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        emit_result(task_id, "error", error=str(e))
+
+
+def handle_compare_engines(task_id: str, params: dict):
+    """Transcribe the same sample window with two engines and report where
+    they disagree. See services/engine_comparison.py for the scoring."""
+    import time as _time
+    from config.paths import paths
+    from services.engine_comparison import compare_engines
+
+    file_path = params.get("file_path", "")
+    if not file_path or not os.path.exists(file_path):
+        emit_result(task_id, "error", error=f"File not found: {file_path}")
+        return
+
+    output_dir = params.get("output_dir") or os.path.join(
+        paths["output"], "engine-comparisons", f"{int(_time.time())}"
+    )
+    try:
+        emit_progress(task_id, "comparing", 10, f"Transcribing with {params.get('engine_a')}...")
+        report = compare_engines(
+            file_path,
+            params.get("engine_a", "whispercpp"),
+            params.get("engine_b", "whisper-py"),
+            start_seconds=params.get("start_seconds", 0.0) or 0.0,
+            duration_seconds=params.get("duration_seconds", 120.0) or 120.0,
+            window_seconds=params.get("window_seconds", 20.0) or 20.0,
+            model_size=params.get("model_size", "small"),
+            language=params.get("language"),
+            output_dir=output_dir,
+        )
+        emit_progress(task_id, "comparing", 100, "Comparison complete")
+        emit_result(task_id, "success", data=report)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        emit_result(task_id, "error", error=str(e))
+
+
+def handle_render_silence_removed(task_id: str, params: dict):
+    """Render the approved local cut plan and remap transcript timestamps."""
+    from config.paths import paths
+    from services.silence_removal import render_silence_removed
+
+    try:
+        result = render_silence_removed(
+            video_path=params.get("video_path", ""),
+            keep_segments=params.get("keep_segments") or [],
+            transcript=params.get("transcript") or {},
+            output_dir=params.get("output_dir") or paths["output"],
+            progress_callback=lambda pct, msg: emit_progress(
+                task_id, "silence_render", pct, msg
+            ),
+        )
+        emit_result(task_id, "success", data=result)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        emit_result(task_id, "error", error=str(e))
+
+
+MULTICAM_MAP_KEYS = ("people", "sources", "range_start", "range_end", "cut_settings", "speaker_map", "look", "removals")
+
+
+def handle_manage_multicam(task_id: str, params: dict):
+    """Multicam podcast editing: map sources, sync, plan cuts, render, export.
+
+    Actions: new (folder or files, people), list, show, map, sync, plan, cut
+    (swap one shot's camera), set_cuts (replace the whole cut), activity (who
+    speaks when), previews (stills), preview (playback proxies), render,
+    export (premiere|fcpxml, review keeps removals in place for an editor to judge),
+    import_timeline (path: an edited FCP 7 XML timeline becomes the cut and removals), delete.
+    sync, plan and render apply any mapping fields sent with them first.
+    """
+    from services import multicam as mc
+
+    action = params.get("action", "show")
+
+    def progress(stage):
+        return lambda p, m: emit_progress(task_id, stage, p, m)
+
+    try:
+        if action == "list":
+            emit_result(task_id, "success", data={"sessions": mc.list_sessions()})
+            return
+        if action == "new":
+            session = mc.new_session(
+                folder=str(params.get("folder") or ""),
+                files=params.get("files"),
+                people=params.get("people"),
+                name=str(params.get("name") or ""),
+                progress_callback=progress("scanning"),
+            )
+            emit_result(task_id, "success", data=mc.payload(session))
+            return
+
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is required. Get one from action 'new' or 'list'.")
+        if action == "delete":
+            mc.delete_session(session_id)
+            emit_result(task_id, "success", data={"deleted": True, "session_id": session_id})
+            return
+
+        session = mc.open_session(session_id)
+        if action == "render" and any(k in params for k in MULTICAM_MAP_KEYS if k != "look"):
+            # A mapping change can drop the cut, and a render needs one: map, then plan, then render.
+            raise ValueError("render takes only look and stems. Change the mapping with 'map', then 'plan' again.")
+        if action in ("map", "sync", "plan", "render") and any(k in params for k in MULTICAM_MAP_KEYS):
+            session = mc.update_mapping(session, params)
+        data: dict = {}
+        if action in ("show", "map"):
+            pass
+        elif action == "sync":
+            session = mc.sync_session(session, force=bool(params.get("force")), progress_callback=progress("syncing"))
+        elif action == "plan":
+            session = mc.plan_session(session, progress_callback=progress("planning"))
+        elif action == "preview":
+            session = mc.build_preview(session, progress_callback=progress("preview"))
+        elif action == "activity":
+            data["activity"] = mc.activity(session)
+        elif action == "set_cuts":
+            session = mc.set_cuts(session, params.get("cuts"))
+        elif action == "cut":
+            index, source_id = params.get("index"), params.get("source_id")
+            if not isinstance(index, int) or not isinstance(source_id, str):
+                raise ValueError("cut needs index (0-based shot number) and source_id (a camera's id)")
+            session = mc.set_cut(session, index, source_id)
+        elif action == "previews":
+            data["previews"] = mc.previews(session, looks=bool(params.get("looks")), at=params.get("at"))
+        elif action == "render":
+            stems = params.get("stems", True)
+            if not isinstance(stems, bool):
+                raise ValueError("stems is true or false")
+            validate = params.get("validate", "sample")
+            if validate not in ("sample", "full"):
+                raise ValueError("validate must be 'sample' or 'full'")
+            mc.render_session(session, stems=stems, validate=validate, progress_callback=progress("rendering"))
+        elif action == "export":
+            data["export_path"] = mc.export_xml(session, params.get("format", "premiere"), review=bool(params.get("review")))
+        elif action == "import_timeline":
+            if not isinstance(params.get("path"), str):
+                raise ValueError("import_timeline needs path: an FCP 7 XML timeline exported from Premiere or Resolve")
+            data["imported"] = mc.import_timeline(session, params["path"])
+            session = mc.MulticamSession.load(session.session_id)
+        elif action == "cloud":
+            from services import multicam_cloud
+            session = multicam_cloud.push(session, progress_callback=progress("sending"))
+        elif action == "pull":
+            from services import multicam_cloud
+            session = multicam_cloud.pull(session)
+            mc.render_session(session, stems=True, progress_callback=progress("rendering"))
+        else:
+            raise ValueError(f"Unknown multicam action {action!r}")
+        emit_result(task_id, "success", data={**mc.payload(session), **data})
+    except KeyError as e:
+        emit_result(task_id, "error", error=f"Missing field {e.args[0]!r}")
+    except Exception as e:
+        # Callers get one sentence; the full trace goes to the log, never to a client.
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        emit_result(task_id, "error", error=str(e) or type(e).__name__)
+
+
+def handle_run_integration_tool(task_id: str, params: dict):
+    from services.integrations import IntegrationRegistry, IntegrationsManager
+
+    integration_name = params.get("integration", "")
+    tool_name = params.get("tool", "")
+    tool_params = params.get("params", {})
+
+    manager = IntegrationsManager()
+    if not manager.is_enabled(integration_name):
+        emit_result(
+            task_id,
+            "error",
+            error=f"Integration '{integration_name}' is disabled. Enable via manage_integrations.",
+        )
+        return
+
+    integration = IntegrationRegistry.get(integration_name)
+    if integration is None:
+        emit_result(task_id, "error", error=f"Unknown integration: {integration_name}")
+        return
+
+    tool = next((t for t in integration.tools() if t.name == tool_name), None)
+    if tool is None:
+        emit_result(task_id, "error", error=f"Unknown tool '{tool_name}' on '{integration_name}'")
+        return
+
+    try:
+        result = tool.handler(tool_params)
+        emit_result(task_id, "success", data=result)
+    except Exception as e:
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        emit_result(task_id, "error", error=f"{type(e).__name__}: {e}")
+
+
+TASK_HANDLERS = {
+    "ping": handle_ping,
+    "resolve_transcribe_engine": handle_resolve_transcribe_engine,
+    "transcribe": handle_transcribe,
+    "compare_engines": handle_compare_engines,
+    "parse_transcript": handle_parse_transcript,
+    "create_clip": handle_create_clip,
+    "batch_clips": handle_batch_clips,
+    "analyze_energy": handle_analyze_energy,
+    "detect_highlights": handle_detect_highlights,
+    "manage_reel": handle_manage_reel,
+    "pack_transcript": handle_pack_transcript,
+    "detect_encoder": handle_detect_encoder,
+    "presets": handle_presets,
+    "corrections": handle_corrections,
+    "suggest_clips": handle_suggest_clips,
+    "rank_candidates": handle_rank_candidates,
+    "process_episode": handle_process_episode,
+    "find_moment": handle_find_moment,
+    "manage_env": handle_manage_env,
+    "ai_cli_status": handle_ai_cli_status,
+    "ai_provider_status": handle_ai_provider_status,
+    "generate_content": handle_generate_content,
+    "generate_custom": handle_generate_custom,
+    "manage_integrations": handle_manage_integrations,
+    "run_integration_tool": handle_run_integration_tool,
+    "manage_config": handle_manage_config,
+    "analyze_silence": handle_analyze_silence,
+    "render_silence_removed": handle_render_silence_removed,
+    "manage_multicam": handle_manage_multicam,
+}
+
+
+def _maybe_auto_migrate_backend(task_type: str, params: dict) -> None:
+    if task_type == "manage_config":
+        action = params.get("action", "status")
+        if action == "status" or (action == "migrate" and params.get("dry_run")):
+            return
+    try:
+        from config_bundle import auto_migrate_legacy_if_pending
+
+        auto_migrate_legacy_if_pending(quiet=True)
+    except Exception as e:
+        print(f"Warning: auto-migrate skipped: {e}", file=sys.stderr, flush=True)
+
+
+def main():
+    try:
+        raw = sys.stdin.readline().strip()
+        if not raw:
+            emit_result("unknown", "error", error="Empty input")
+            sys.exit(1)
+
+        request = json.loads(raw)
+        task_id = request.get("task_id", "unknown")
+        task_type = request.get("task_type", "")
+        params = request.get("params", {})
+
+        _maybe_auto_migrate_backend(task_type, params)
+
+        handler = TASK_HANDLERS.get(task_type)
+        if not handler:
+            emit_result(task_id, "error", error=f"Unknown task type: {task_type}")
+            sys.exit(1)
+
+        handler(task_id, params)
+
+    except Exception as e:
+        task_id = "unknown"
+        try:
+            task_id = json.loads(raw).get("task_id", "unknown")
+        except Exception as exc:
+            log_warn("main", "could not read task_id from request", error=exc)
+        emit_result(task_id, "error", error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

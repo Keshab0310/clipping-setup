@@ -1,0 +1,1 @@
+Look at my content log and my last 7 days of stats. Give me: the top 3 posts and why they worked, the bottom 3 and why they flopped, the best posting times, and 3 experiments for next week. Keep it to one screen.

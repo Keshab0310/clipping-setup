@@ -1,0 +1,12 @@
+{
+  "accounts": {
+    "youtube": "I was in Chat",
+    "tiktok": "@iwasinchat09",
+    "instagram": "iwasinchat09",
+    "facebook": "Justin Hamlet"
+  },
+  "default_platforms": ["youtube", "tiktok", "instagram", "facebook"],
+  "max_posts_per_day": 2,
+  "upload_limit_mb": 9.5,
+  "campaign_submit_minutes": 30
+}

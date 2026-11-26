@@ -1,0 +1,34 @@
+# Transcription
+openai-whisper>=20250625
+
+# Speaker diarization (optional: only needed if you enable local speaker detection)
+# Most users don't need this: Claude handles speaker identification via MCP,
+# and the "Paste Transcript" flow supports Speaker (MM:SS) labels natively.
+# To enable: pip install pyannote.audio speechbrain && set HF_TOKEN in .env
+# pyannote.audio>=3.1.0
+# speechbrain>=1.0.0
+
+# Face detection (optional, for smart cropping)
+opencv-python-headless>=4.8.1.78
+numpy>=2.5.2
+
+# Audio-event detection (laughter/reaction channel via YAMNet ONNX, no torch/TF)
+onnxruntime>=1.28.0
+
+# --engine omnilingual: Meta's Omnilingual ASR CTC model via sherpa-onnx, for
+# languages whisper.cpp handles poorly (e.g. Georgian). No torch/TF.
+sherpa-onnx>=1.13.8
+
+# Thumbnails
+Pillow>=12.3.0
+
+# CLI interactive prompts
+questionary>=2.1.1
+
+# Utilities
+python-dotenv>=1.2.2
+yt-dlp>=2026.7.4
+
+# YouTube analytics (optional: only needed for live OAuth sync; CSV import works without these)
+google-api-python-client>=2.198.0
+google-auth-oauthlib>=1.4.0

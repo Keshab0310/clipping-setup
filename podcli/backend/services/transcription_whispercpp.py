@@ -1,0 +1,273 @@
+"""whisper.cpp adapter behind the transcribe_file contract.
+
+Tokens carry a leading-space convention (" and", continuations have none); we
+merge on that boundary and strip word text. The strip must match the rest of the
+pipeline exactly: apply_corrections() and caption spacing key on stripped text.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Optional
+
+_SPECIAL = re.compile(r"^\[.*\]$")  # [_BEG_], [_TT_...], etc.
+
+# whisper.cpp's WHISPER_AHEADS_* presets. The alignment heads are per-architecture:
+# passing a preset whose layer/head indices exceed the loaded model's dimensions
+# aborts whisper-cli with exit 3, so the preset must track the model, not a default.
+_DTW_PRESETS = {
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large.v1", "large.v2", "large.v3", "large.v3-turbo",
+}
+_QUANT_SUFFIX = re.compile(r"-(?:q\d+(?:_\d+)?(?:_?[a-z]+)*|f16|f32)$", re.IGNORECASE)
+
+
+def _dtw_preset_for_model(model_path: str) -> Optional[str]:
+    name = os.path.basename(model_path)
+    for ext in (".bin", ".gguf"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    if name.lower().startswith("ggml-"):
+        name = name[5:]
+    name = _QUANT_SUFFIX.sub("", name).lower()
+    if name.startswith("large-v"):
+        name = "large." + name[len("large-"):]
+    return name if name in _DTW_PRESETS else None
+
+
+def _extract_wav(media_path: str, wav_path: str, ffmpeg: str = "ffmpeg") -> None:
+    subprocess.run(
+        [ffmpeg, "-y", "-loglevel", "error", "-i", media_path,
+         "-ar", "16000", "-ac", "1", wav_path],
+        check=True,
+        timeout=1800,
+    )
+
+
+def _tokens_to_words(tokens: list[dict]) -> list[dict]:
+    """Merge whisper.cpp subword tokens into words with start/end seconds."""
+    words: list[dict] = []
+    cur_text = ""
+    cur_start: Optional[float] = None
+    cur_end: Optional[float] = None
+
+    def flush():
+        nonlocal cur_text, cur_start, cur_end
+        text = cur_text.strip().lstrip("▁").strip()
+        if text and cur_start is not None:
+            words.append({
+                "word": text,
+                "start": round(cur_start / 1000.0, 3),
+                "end": round(cur_end / 1000.0, 3),
+                "speaker": None,
+            })
+        cur_text, cur_start, cur_end = "", None, None
+
+    for tok in tokens:
+        raw = tok.get("text", "")
+        if _SPECIAL.match(raw.strip()):
+            continue
+        off = tok.get("offsets") or {}
+        t0, t1 = off.get("from"), off.get("to")
+        starts_word = raw.startswith(" ") or raw.startswith("▁")
+        if starts_word and cur_text:
+            flush()
+        if cur_start is None and t0 is not None:
+            cur_start = t0
+        cur_text += raw
+        if t1 is not None:
+            cur_end = t1
+    flush()
+    return words
+
+
+def _frame_rms(samples, hop: int, frame: int, nf: int):
+    """Per-frame RMS via a running sum of squares, O(n) instead of the
+    O(nf * frame) index-matrix this replaces (see _voiced_intervals).
+
+    The cumulative sum has to be float64. float32 has ~7 decimal digits of
+    precision; on a long file the running total grows into the 1e13-1e15
+    range, where a single float32 ULP is already bigger than a whole
+    frame's sum of squares, so window_sums (a difference of two large
+    nearly-equal floats) comes out wrong for frames late in the file. A
+    short test clip never sums high enough to show this: the regression
+    only appears on real multi-hour episodes.
+    """
+    import numpy as np
+
+    sq = samples.astype(np.float64) ** 2
+    csum = np.concatenate(([0.0], np.cumsum(sq, dtype=np.float64)))
+    starts = np.arange(nf) * hop
+    window_sums = csum[starts + frame] - csum[starts]
+    return np.sqrt(np.maximum(window_sums, 0.0) / frame)
+
+
+def _voiced_intervals(wav_path: str, bridge: float = 0.3, thresh_ratio: float = 0.07):
+    import wave
+
+    import numpy as np
+
+    try:
+        w = wave.open(wav_path, "rb")
+        sr, width, n = w.getframerate(), w.getsampwidth(), w.getnframes()
+        raw = w.readframes(n)
+        w.close()
+    except Exception:
+        return []
+    if width != 2 or sr <= 0 or not raw:
+        return []
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    hop = max(1, int(sr * 0.010))
+    frame = max(hop, int(sr * 0.025))
+    if len(samples) < frame:
+        return []
+    nf = 1 + (len(samples) - frame) // hop
+    rms = _frame_rms(samples, hop, frame, nf)
+    peak = float(rms.max())
+    if peak <= 0:
+        return []
+    voiced = rms > thresh_ratio * peak
+    intervals, start = [], None
+    for i, v in enumerate(voiced):
+        if v and start is None:
+            start = i * hop / sr
+        elif not v and start is not None:
+            intervals.append([start, i * hop / sr])
+            start = None
+    if start is not None:
+        intervals.append([start, nf * hop / sr])
+    merged = []
+    for iv in intervals:
+        if merged and iv[0] - merged[-1][1] <= bridge:
+            merged[-1][1] = iv[1]
+        else:
+            merged.append(iv)
+    return merged
+
+
+def _snap_words_to_voiced(words: list[dict], wav_path: str) -> list[dict]:
+    """Pull word timings back into the voiced span. whisper.cpp sometimes
+    stretches trailing words across trailing silence; clamping to [first voiced,
+    last voiced] (with a small pad) and re-flowing keeps captions in sync without
+    disturbing words that already overlap speech."""
+    if not words:
+        return words
+    intervals = _voiced_intervals(wav_path)
+    if not intervals:
+        return words
+    pad = 0.15
+    lo = max(0.0, intervals[0][0] - pad)
+    hi = intervals[-1][1] + pad
+    out, prev_end = [], lo
+    for w in words:
+        s = min(max(float(w.get("start", 0.0)), lo), hi)
+        e = min(max(float(w.get("end", 0.0)), lo), hi)
+        if s < prev_end:
+            s = prev_end
+        if e <= s:
+            # A word clamped to hi would otherwise collapse to zero length; a
+            # tiny overhang past the voiced pad is harmless, a zero-length
+            # caption event is not.
+            e = s + 0.05
+        prev_end = e
+        out.append({**w, "start": round(s, 3), "end": round(e, 3)})
+    return out
+
+
+def transcribe_file(
+    file_path: str,
+    model_path: str,
+    whisper_cli: str = "whisper-cli",
+    ffmpeg: str = "ffmpeg",
+    language: Optional[str] = None,
+    dtw_model: Optional[str] = None,
+    threads: int = 4,
+    vad: bool = False,
+    vad_model: Optional[str] = None,
+    wav_path: Optional[str] = None,
+    **_ignored,
+) -> dict:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(file_path)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"ggml model not found: {model_path}")
+
+    tmpdir = tempfile.mkdtemp(prefix="wcpp_")
+    out_base = os.path.join(tmpdir, "out")
+    try:
+        if wav_path and os.path.exists(wav_path):
+            wav = wav_path
+        else:
+            wav = os.path.join(tmpdir, "audio.wav")
+            _extract_wav(file_path, wav, ffmpeg)
+
+        cmd = [whisper_cli, "-m", model_path, "-f", wav, "-ojf",
+               "-of", out_base, "-t", str(threads)]
+        dtw = dtw_model if dtw_model is not None else _dtw_preset_for_model(model_path)
+        if dtw:
+            cmd += ["-dtw", dtw]
+        if vad and vad_model and os.path.exists(vad_model):
+            # VAD removes the trailing-words-into-silence failure mode but adds a
+            # systematic early bias (silence-removal remapping). Off by default;
+            # the energy-snap below addresses the same defect without the bias.
+            cmd += ["--vad", "--vad-model", vad_model]
+        # An unset language must not fall through to whisper-cli's own "en"
+        # default; "auto" makes it run language detection instead.
+        cmd += ["-l", language or "auto"]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=7200)
+
+        with open(out_base + ".json", encoding="utf-8") as f:
+            data = json.load(f)
+
+        transcription = data.get("transcription", [])
+        segments, words = [], []
+        for i, seg in enumerate(transcription):
+            off = seg.get("offsets") or {}
+            segments.append({
+                "id": i,
+                "start": round((off.get("from") or 0) / 1000.0, 3),
+                "end": round((off.get("to") or 0) / 1000.0, 3),
+                "text": (seg.get("text") or "").strip(),
+                "speaker": None,
+            })
+            words.extend(_tokens_to_words(seg.get("tokens", [])))
+
+        if os.environ.get("PODCLI_WHISPERCPP_NO_SNAP", "").strip().lower() not in ("1", "true", "yes", "on"):
+            words = _snap_words_to_voiced(words, wav)
+
+        return {
+            "transcript": " ".join(s["text"] for s in segments).strip(),
+            "segments": segments,
+            "words": words,
+            "duration": segments[-1]["end"] if segments else 0.0,
+            # whisper-cli reports the language it actually detected under
+            # "result"; "params" only echoes back what we passed in ("auto"
+            # when unset), so it can't label the output.
+            "language": (
+                (data.get("result") or {}).get("language")
+                or (data.get("params") or {}).get("language")
+                or language
+                or "en"
+            ),
+        }
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    # Quick CLI: transcribe_whispercpp <media> <model> [out.json]
+    media, model = sys.argv[1], sys.argv[2]
+    out = sys.argv[3] if len(sys.argv) > 3 else None
+    result = transcribe_file(media, model)
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(payload)
+        print(f"{len(result['words'])} words, {len(result['segments'])} segments -> {out}")
+    else:
+        print(payload)

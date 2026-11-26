@@ -1,0 +1,2 @@
+- [Store clips locally and in Drive](store-clips-local-and-drive.md) — finished clips go on the computer and in Google Drive for remote review
+- [Clip stableronaldo live](clip-stableronaldo-live.md) — stableronaldo replaces Lacy; watch live, keep a rolling buffer, no full downloads

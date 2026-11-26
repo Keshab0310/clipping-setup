@@ -1,0 +1,163 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { handleTranscribe, type TranscribeDeps } from "./transcribe.handler.js";
+
+const executeMock = vi.fn();
+const cacheGetMock = vi.fn();
+const cacheSetMock = vi.fn();
+const cacheGetPackedMock = vi.fn();
+const cacheGetHashForEngineMock = vi.fn();
+
+const deps: TranscribeDeps = {
+  executor: { execute: executeMock },
+  cache: {
+    get: cacheGetMock,
+    set: cacheSetMock,
+    getPackedMarkdown: cacheGetPackedMock,
+    getFileHashForEngine: cacheGetHashForEngineMock,
+  },
+  resolveEngine: async () => ({ engine: "whispercpp", model: "small" }),
+};
+
+describe("handleTranscribe, sample mode", () => {
+  beforeEach(() => {
+    executeMock.mockReset();
+    cacheGetMock.mockReset();
+    cacheSetMock.mockReset();
+    cacheGetPackedMock.mockReset();
+  });
+
+  it("never reads the main cache when start_seconds/duration_seconds are set", async () => {
+    executeMock.mockResolvedValue({
+      data: { transcript: "hi", segments: [], words: [], duration: 40, language: "ka", engine: "whispercpp" },
+    });
+
+    const result = await handleTranscribe({
+      file_path: "/video.mp4",
+      start_seconds: 120,
+      duration_seconds: 40,
+    }, deps);
+
+    expect(cacheGetMock).not.toHaveBeenCalled();
+    const parsed = JSON.parse(result);
+    expect(parsed.cached).toBe(false);
+    expect(parsed.packed_ready).toBe(false);
+  });
+
+  it("never writes the main cache for a sample result", async () => {
+    executeMock.mockResolvedValue({
+      data: {
+        transcript: "hi",
+        segments: [],
+        words: [],
+        duration: 40,
+        language: "ka",
+        engine: "whispercpp",
+        complete: false,
+        sample_offset_seconds: 120,
+      },
+    });
+
+    const result = await handleTranscribe({
+      file_path: "/video.mp4",
+      start_seconds: 120,
+      duration_seconds: 40,
+    }, deps);
+
+    expect(cacheSetMock).not.toHaveBeenCalled();
+    const parsed = JSON.parse(result);
+    expect(parsed.complete).toBe(false);
+    expect(parsed.sample_offset_seconds).toBe(120);
+  });
+
+  it("passes start_seconds/duration_seconds through to the transcribe task", async () => {
+    executeMock.mockResolvedValue({
+      data: { transcript: "hi", segments: [], words: [], duration: 40, language: "ka", engine: "whispercpp" },
+    });
+
+    await handleTranscribe({ file_path: "/video.mp4", start_seconds: 10, duration_seconds: 30 }, deps);
+
+    expect(executeMock).toHaveBeenCalledWith(
+      "transcribe",
+      expect.objectContaining({ start_seconds: 10, duration_seconds: 30 }),
+    );
+  });
+
+  it("treats duration_seconds: 0 as a normal (non-sample) request", async () => {
+    cacheGetMock.mockResolvedValue(null);
+    executeMock.mockResolvedValue({
+      data: { transcript: "hi", segments: [], words: [], duration: 400, language: "en", engine: "whispercpp" },
+    });
+    cacheGetPackedMock.mockResolvedValue("# packed");
+
+    const result = await handleTranscribe({ file_path: "/video.mp4", duration_seconds: 0 }, deps);
+
+    expect(cacheGetMock).toHaveBeenCalled();
+    expect(cacheSetMock).toHaveBeenCalled();
+    const parsed = JSON.parse(result);
+    expect(parsed.complete).toBeUndefined();
+  });
+
+  it("still uses the main cache for a normal (non-sample) request", async () => {
+    cacheGetMock.mockResolvedValue(null);
+    executeMock.mockResolvedValue({
+      data: { transcript: "hi", segments: [], words: [], duration: 400, language: "en", engine: "whispercpp" },
+    });
+    cacheGetPackedMock.mockResolvedValue("# packed");
+
+    await handleTranscribe({ file_path: "/video.mp4" }, deps);
+
+    expect(cacheGetMock).toHaveBeenCalled();
+    expect(cacheSetMock).toHaveBeenCalled();
+  });
+
+  it("keys the cache by the model the backend says it will run, not the request default", async () => {
+    cacheGetMock.mockResolvedValue(null);
+    executeMock.mockResolvedValue({
+      data: { transcript: "hi", segments: [], words: [], duration: 400, language: "en", engine: "whispercpp" },
+    });
+    cacheGetPackedMock.mockResolvedValue("# packed");
+
+    const baseOnlyDeps: TranscribeDeps = {
+      ...deps,
+      resolveEngine: async () => ({ engine: "whispercpp", model: "base" }),
+    };
+
+    await handleTranscribe({ file_path: "/video.mp4" }, baseOnlyDeps);
+
+    expect(cacheGetMock).toHaveBeenCalledWith("/video.mp4", {
+      engine: "whispercpp",
+      model: "base",
+      language: undefined,
+    });
+    expect(executeMock).toHaveBeenCalledWith("transcribe", expect.objectContaining({ model_size: "small" }));
+    expect(cacheSetMock).toHaveBeenCalledWith("/video.mp4", expect.anything(), {
+      engine: "whispercpp",
+      model: "base",
+      language: undefined,
+    });
+  });
+
+  it("caches under the model the transcript reports it ran with", async () => {
+    cacheGetMock.mockResolvedValue(null);
+    executeMock.mockResolvedValue({
+      data: {
+        transcript: "hi",
+        segments: [],
+        words: [],
+        duration: 400,
+        language: "en",
+        engine: "whispercpp",
+        model_size: "base",
+      },
+    });
+    cacheGetPackedMock.mockResolvedValue("# packed");
+
+    await handleTranscribe({ file_path: "/video.mp4" }, deps);
+
+    expect(cacheSetMock).toHaveBeenCalledWith("/video.mp4", expect.anything(), {
+      engine: "whispercpp",
+      model: "base",
+      language: undefined,
+    });
+  });
+});

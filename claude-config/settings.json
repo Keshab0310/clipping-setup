@@ -1,0 +1,32 @@
+{
+  "model": "opus[1m]",
+  "enabledPlugins": {
+    "claude-mem@thedotmack": true,
+    "agent-memory@keshab-plugins": true,
+    "frontend-design@claude-plugins-official": true,
+    "prompt-enhancer@prompt-enhancer-marketplace": true,
+    "lemo-opuscar@lemolab": true
+  },
+  "extraKnownMarketplaces": {
+    "keshab-plugins": {
+      "source": {
+        "source": "directory",
+        "path": "D:\\EverythingClaude\\multi_agent_sketch"
+      }
+    },
+    "prompt-enhancer-marketplace": {
+      "source": {
+        "source": "directory",
+        "path": "D:\\claude-prompt-enhancer"
+      }
+    },
+    "lemolab": {
+      "source": {
+        "source": "github",
+        "repo": "lemomo-ai/lemo-opuscar"
+      }
+    }
+  },
+  "tui": "fullscreen",
+  "agentPushNotifEnabled": true
+}

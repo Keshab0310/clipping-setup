@@ -1,0 +1,370 @@
+import { z } from "zod";
+import { PythonExecutor } from "../services/python-executor.js";
+import { FileManager } from "../services/file-manager.js";
+import { readUIStateFile } from "../services/ui-state-file.js";
+import { ClipsHistory } from "../services/clips-history.js";
+import { paths } from "../config/paths.js";
+import { webServerUrl } from "../config/server.js";
+import { validateClipRange } from "../utils/clip-validation.js";
+import { resolveCleanFillers } from "../utils/clean-fillers.js";
+import { findContentType } from "../utils/transcript.js";
+import { validateHook } from "../utils/clip-hook.js";
+import { transcriptVideoMismatch } from "../utils/video-identity.js";
+import { childLogger } from "../utils/logger.js";
+import { FORMATS } from "../models/index.js";
+import type {
+  BatchClipsInput,
+  BatchClipSpec,
+  BatchClipsResult,
+  SuggestedClip,
+  UIState,
+} from "../models/index.js";
+
+const log = childLogger("batch-clips");
+const executor = new PythonExecutor();
+const fileManager = new FileManager();
+const history = new ClipsHistory();
+
+const jobStartedSchema = z.object({ job_id: z.string(), status: z.string() });
+
+/** Load UI state from disk. Returns null if unavailable. */
+function loadState(): UIState | null {
+  try {
+    return readUIStateFile();
+  } catch (err) {
+    log.debug("UI state unavailable", { err: err instanceof Error ? err.message : err });
+
+    return null;
+  }
+}
+
+export const batchClipsToolDef = {
+  name: "batch_create_clips",
+  description:
+    "STEP 3: Export multiple clips at once as finished vertical shorts.\n\n" +
+    "EASIEST: pass export_selected=true to export all selected clips in one go.\n" +
+    "Alternative: pass clip_numbers=[1, 3, 5] for specific ones.\n" +
+    "Everything (video, timestamps, settings) auto-loads from session state.\n\n" +
+    "Pass exactly one of clips, clip_numbers, or export_selected. If several are given, " +
+    "an explicit clips array wins, then export_selected, then clip_numbers.\n\n" +
+    "Each clip gets: 9:16 vertical crop, burned-in captions, normalized audio, H.264 MP4.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      export_selected: {
+        type: "boolean",
+        description:
+          "Export all selected (non-deselected) clips from session state. Simplest option.",
+      },
+      clip_numbers: {
+        type: "array",
+        items: { type: "number" },
+        description:
+          "Export specific clips by number (e.g. [1, 3, 5]). " +
+          "Auto-fills everything from session state.",
+      },
+      video_path: {
+        type: "string",
+        description:
+          "Path to the podcast video. Auto-loaded from session state if omitted.",
+      },
+      clips: {
+        type: "array",
+        description: "Array of clips to create (not needed if using clip_numbers)",
+        items: {
+          type: "object",
+          properties: {
+            start_second: { type: "number" },
+            end_second: { type: "number" },
+            title: { type: "string" },
+            caption_style: {
+              type: "string",
+              enum: ["hormozi", "karaoke", "subtle", "branded"],
+            },
+            crop_strategy: {
+              type: "string",
+              enum: ["center", "face", "speaker"],
+            },
+            format: {
+              type: "string",
+              enum: [...FORMATS],
+            },
+            allow_ass_fallback: {
+              type: "boolean",
+            },
+            hook: {
+              type: ["object", "null"],
+              description:
+                "Opening hook: { start, end, mode: repeat|move }, a 1-15s passage from inside the clip played first. " +
+                "Null renders without one.",
+            },
+          },
+          required: ["start_second", "end_second"],
+        },
+      },
+      clean_fillers: {
+        type: "boolean",
+        description:
+          "Remove filler words (um, uh, hmm) from captions and compress long silences. Default: true",
+        default: true,
+      },
+      allow_ass_fallback: {
+        type: "boolean",
+        description:
+          "Allow fallback to legacy ASS captions if Remotion caption rendering fails. Default: false.",
+        default: false,
+      },
+      keep_caption_overlay: {
+        type: "boolean",
+        description:
+          "Keep ProRes 4444 alpha caption overlays for DaVinci Resolve export. Default: false.",
+        default: false,
+      },
+      write_clean_variant: {
+        type: "boolean",
+        description:
+          "Also render a clean (no burned captions) variant per clip, with the same audio, loudness, and intro/outro. Returns clean_output_path per clip. Default: false.",
+        default: false,
+      },
+      transcript_words: {
+        type: "array",
+        description:
+          "Word-level timestamps. Auto-loaded from session state if omitted.",
+        items: {
+          type: "object",
+          properties: {
+            word: { type: "string" },
+            start: { type: "number" },
+            end: { type: "number" },
+            confidence: { type: "number" },
+          },
+        },
+      },
+      async_mode: {
+        type: "boolean",
+        description:
+          "Return a job_id immediately and render in the background. Use for multi-clip " +
+          "batches so Claude can poll job_status and emit live progress to the user. " +
+          "Requires the Web UI to be running (npm run ui). Default: false (sync).",
+        default: false,
+      },
+    },
+    required: [],
+  },
+};
+
+export async function handleBatchClips(input: BatchClipsInput): Promise<string> {
+  await fileManager.ensureDirectories();
+
+  const state = loadState();
+  const settings = state?.settings ?? {};
+  const suggestions: SuggestedClip[] = state?.suggestions ?? [];
+  const transcript = state?.transcript ?? null;
+
+  // Auto-resolve video path
+  const videoPath = input.video_path || state?.videoPath || "";
+
+  if (!videoPath) {
+    return JSON.stringify({ error: "video_path is required (no video in session state)" });
+  }
+
+  // When the caller relies on the session transcript (rather than passing
+  // transcript_words explicitly), refuse to render against a video that was
+  // swapped in after that transcript was generated.
+  if (input.transcript_words == null && transcript) {
+    const mismatch = transcriptVideoMismatch(state?.transcriptVideoIdentity, videoPath);
+
+    if (mismatch) {
+      return JSON.stringify({ error: mismatch });
+    }
+  }
+
+  // Auto-resolve transcript words
+  const transcriptWords = input.transcript_words ?? transcript?.words ?? [];
+
+  // Build clips array: from export_selected, clip_numbers, or explicit clips
+  let clips: BatchClipSpec[];
+  const deselected = state?.deselectedIndices ?? [];
+
+  const batchFormat = input.format || settings.format || "vertical";
+  const cleanFillers = resolveCleanFillers(input.clean_fillers, settings.cleanFillers, batchFormat);
+
+  const buildClipFromSuggestion = (s: SuggestedClip, num: number): BatchClipSpec => ({
+    start_second: s.start_second,
+    end_second: s.end_second,
+    title: s.title || `clip_${num}`,
+    caption_style: s.suggested_caption_style || settings.captionStyle || "hormozi",
+    crop_strategy: settings.cropStrategy || "speaker",
+    format: batchFormat,
+    allow_ass_fallback: input.allow_ass_fallback === true,
+    keep_caption_overlay: input.keep_caption_overlay === true,
+    write_clean_variant: input.write_clean_variant === true,
+    logo_path: settings.logoPath || null,
+    ...(s.segments && s.segments.length > 0 && { keep_segments: s.segments }),
+    ...(s.hook && { hook: s.hook }),
+  });
+
+  if (input.export_selected) {
+    // Export all selected (non-deselected) clips
+    clips = [];
+
+    for (let i = 0; i < suggestions.length; i++) {
+      if (!deselected.includes(i)) {
+        clips.push(buildClipFromSuggestion(suggestions[i], i + 1));
+      }
+    }
+
+    if (clips.length === 0) {
+      return JSON.stringify({
+        error: `No selected clips to export. ${suggestions.length} total, all deselected.`,
+      });
+    }
+  } else if (input.clip_numbers) {
+    const errors: string[] = [];
+    clips = [];
+
+    for (const num of input.clip_numbers) {
+      const idx = num - 1;
+
+      if (idx < 0 || idx >= suggestions.length) {
+        errors.push(`Clip #${num} not found`);
+        continue;
+      }
+
+      clips.push(buildClipFromSuggestion(suggestions[idx], num));
+    }
+
+    if (clips.length === 0) {
+      return JSON.stringify({
+        error: `No valid clips found. ${errors.join(", ")}. Available: 1-${suggestions.length}`,
+      });
+    }
+  } else if (input.clips) {
+    clips = input.clips;
+  } else {
+    return JSON.stringify({
+      error: "Use export_selected=true, clip_numbers=[1, 3], or pass clips array",
+    });
+  }
+
+  if (input.keep_caption_overlay === true) {
+    clips = clips.map((c) => ({ ...c, keep_caption_overlay: c.keep_caption_overlay ?? true }));
+  }
+
+  if (input.write_clean_variant === true) {
+    clips = clips.map((c) => ({ ...c, write_clean_variant: c.write_clean_variant ?? true }));
+  }
+
+  for (let i = 0; i < clips.length; i++) {
+    const rangeError = validateClipRange(
+      clips[i].start_second,
+      clips[i].end_second,
+      clips[i].format || batchFormat,
+    );
+
+    if (rangeError) {
+      return JSON.stringify({ error: `Clip ${i + 1}: ${rangeError}` });
+    }
+
+    const hookError = validateHook(
+      clips[i].hook,
+      clips[i].start_second,
+      clips[i].end_second,
+      clips[i].keep_segments,
+    );
+
+    if (hookError) {
+      return JSON.stringify({ error: `Clip ${i + 1}: ${hookError}` });
+    }
+  }
+
+  // Async path: route through Web UI so caller can poll job_status for
+  // live progress during a multi-minute render. Falls back to sync if the
+  // UI isn't running.
+  if (input.async_mode) {
+    try {
+      const res = await fetch(`${webServerUrl}/api/batch-clips`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_path: videoPath,
+          clips,
+          format: batchFormat,
+          transcript_words: transcriptWords,
+          clean_fillers: cleanFillers,
+          logo_path: settings.logoPath || null,
+          outro_path: settings.outroPath || null,
+          intro_path: settings.introPath || null,
+          keep_caption_overlay: input.keep_caption_overlay === true,
+          write_clean_variant: input.write_clean_variant === true,
+        }),
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      const data = jobStartedSchema.parse(await res.json());
+
+      return JSON.stringify({
+        job_id: data.job_id,
+        status: data.status,
+        clip_count: clips.length,
+        next_step: `Poll job_status("${data.job_id}", wait_seconds: 30) in a loop, emitting one terse progress line to the user between polls (e.g. "Rendering 3/7, clip #3"). Stop when done=true.`,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      if (msg.includes("ECONNREFUSED") || msg.includes("fetch failed")) {
+        log.warn("Web UI unavailable, falling back to sync batch render", { err: msg });
+        // fall through to sync path
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  const result = await executor.execute<BatchClipsResult>("batch_clips", {
+    video_path: videoPath,
+    clips,
+    format: batchFormat,
+    transcript_words: transcriptWords,
+    clean_fillers: cleanFillers,
+    allow_ass_fallback: input.allow_ass_fallback === true,
+    keep_caption_overlay: input.keep_caption_overlay === true,
+    write_clean_variant: input.write_clean_variant === true,
+    output_dir: paths.output,
+    logo_path: settings.logoPath || null,
+    outro_path: settings.outroPath || null,
+    intro_path: settings.introPath || null,
+  });
+
+  if (!result.data) {
+    throw new Error("Batch clip creation returned no data");
+  }
+
+  const data = result.data;
+
+  const recorded = await history.recordBatchResults(data.results, {
+    sourceVideo: videoPath,
+    transcriptWords: transcriptWords,
+    defaultCaptionStyle: settings.captionStyle || "hormozi",
+    defaultCropStrategy: settings.cropStrategy || "speaker",
+    defaultFormat: batchFormat,
+    contentTypeFor: (s, e) => findContentType(suggestions, s, e),
+    suggestions,
+  });
+
+  await history.persistBatchRecipes(data.results, recorded, {
+    transcriptWords: transcriptWords,
+    clipSpecs: clips,
+    logoPath: settings.logoPath || null,
+    outroPath: settings.outroPath || null,
+    introPath: settings.introPath || null,
+    cleanFillers,
+  });
+
+  return JSON.stringify({
+    total_clips: data.total_clips,
+    successful_clips: data.successful_clips,
+    results: data.results,
+    message: `Batch complete: ${data.successful_clips}/${data.total_clips} clips created successfully.`,
+  });
+}

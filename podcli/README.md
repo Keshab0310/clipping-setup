@@ -1,0 +1,176 @@
+<p align="center">
+  <img src="public/podcli-badge.png" height="72" alt="podcli" />
+</p>
+
+<p align="center">
+  <strong>Open-source AI podcast clipper.</strong><br/>
+  Turn a long episode into short clips with face tracking and burned-in captions. Drive it from the CLI, a web studio, or your coding agent.
+</p>
+
+<p align="center">
+  <a href="https://podcli.com"><strong>podcli.com</strong></a> ·
+  <a href="https://podcli.com/docs">Docs</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#use-it-from-your-agent">MCP</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/nmbrthirteen/podcli/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="license: AGPL-3.0" /></a>
+  <a href="https://github.com/nmbrthirteen/podcli/stargazers"><img src="https://img.shields.io/github/stars/nmbrthirteen/podcli?style=social" alt="stars" /></a>
+</p>
+
+<p align="center">
+  <a href="https://x.com/nikasiradze_/status/2056061654664708570">
+    <img src="public/promo.gif" alt="Podcli demo" width="720" />
+  </a>
+</p>
+<p align="center"><sub>▶ <a href="https://x.com/nikasiradze_/status/2056061654664708570">Watch with sound on X</a></sub></p>
+
+```bash
+podcli process episode.mp4
+```
+
+That one command transcribes the episode, picks the moments worth clipping, crops to the visible face, and burns the captions in. Transcription and rendering run on your machine. Clip scoring uses Claude Code or Codex login, or an Anthropic API key; without those it falls back to heuristics.
+
+## Install
+
+No prerequisites. The installer fetches a self-contained binary, and the first run provisions Python, Node, FFmpeg, whisper.cpp, and the models it needs into a managed folder.
+
+**macOS and Linux**
+
+```bash
+curl -fsSL https://podcli.com/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://podcli.com/install.ps1 | iex
+```
+
+Runs on macOS (Apple Silicon), Linux (x64 and arm64), and Windows (x64). Intel Macs aren't supported.
+
+## Quick start
+
+```bash
+podcli                       # interactive menu, opens the web studio
+podcli process episode.mp4   # transcribe, pick moments, render clips
+podcli multicam ~/ep12       # sync every camera and mic, cut to the speaker, render the episode
+```
+
+Clips land in `podcli-clips/` in the directory you ran it from, so each show keeps its own renders. Everything else (knowledge, presets, assets, clip history, cache) lives in one managed folder that follows you between directories. Set `PODCLI_OUTPUT` to render somewhere fixed instead.
+
+## What you get
+
+**Clips**
+
+- 9:16, 16:9, or 1:1, with captions sized for each canvas
+- Face tracking that follows the visible face, split-screen layouts included. Following the active speaker needs AssemblyAI, or a source install with openai-whisper and `HF_TOKEN`
+- Multi-segment cuts that drop filler, long pauses, and tangents
+- Four caption styles: branded, hormozi, karaoke, subtle
+- Logos, intros, outros, and background music from a reusable asset library
+- Loudness-normalized audio and hardware encoding on VideoToolbox and NVENC, with a CPU fallback
+
+**Editing the full episode**
+
+- Multicam edit: point at one folder of camera and mic files, confirm who each file belongs to, and podcli syncs them by audio and corrects clock drift between devices
+- Automatic camera cuts that follow whoever is talking, with wide shots for crosstalk and a guest's answer held on the guest
+- Remote shows too: one file per person becomes a split screen, and a single gallery recording is split into a camera per tile. Questions stay on the split and the guest goes full frame on long answers
+- Render the episode as an MP4 with one WAV per person. Studio shoots can also go to Premiere or Final Cut as a timeline that points at your original files
+- Same edit from the studio (Multicam edit), the CLI (`podcli multicam <folder>`), or an agent (`manage_multicam`). Re-running reuses the sync and the cut, so only the step you changed runs again
+- With podcli Pro, steer the cut in the cloud editor: `podcli multicam <folder> --cloud` uploads per-camera proxies, a mic mix (about 550 MB for a two-hour, three-camera episode), and the transcript. Your original camera files stay on your computer, and `--pull` renders the cut you made there
+
+**Finding the moments**
+
+- Whisper transcription (speaker diarization on AssemblyAI, or openai-whisper from a source install or `podcli setup --speakers`), or bring your own transcript as `.txt`, `.srt`, or `.vtt`
+- AssemblyAI as an alternative engine, and yt-dlp to pull an episode straight from a URL
+- AI scoring against your knowledge base, checked against your episode database so it stops resuggesting moments you already published
+- Audio energy and laughter detection to build highlight reels
+
+**The studio at `localhost:3847`**
+
+- Library, episode workspace, multicam edit, per-clip detail, highlights, thumbnails, content, analytics, assets, knowledge, config, integrations, and MCP setup
+- `⌘K` command palette across pages, clips, and assets
+- Titles, descriptions, tags, and hashtags, with any section regenerated on your own guidance
+- Thumbnail studio for 16:9 and 9:16, with frame and text options
+- Transcript corrections that carry through to every render
+
+**Shipping it**
+
+- 32 MCP tools, so an agent can transcribe, score, and render through conversation
+- YouTube analytics to see which clips landed
+- DaVinci Resolve export as FCPXML when you want to finish by hand
+- Presets, clip history with duplicate detection, and a transcript cache
+
+## Why podcli
+
+If you are weighing podcli against the cloud clippers, this is the difference:
+
+- Runs locally. Transcription and rendering happen on your machine by default, so episodes stay there. Data leaves your machine only through these destinations:
+  - AssemblyAI, if you pick that engine: the episode audio.
+  - AI scoring and titles: the transcript goes to podcli Pro when you are signed in, to Anthropic when you set `ANTHROPIC_API_KEY`, and to the provider behind your Claude Code or Codex login.
+  - podcli Pro, when signed in: knowledge and asset sync, plus rendered clips and transcript slices if you turn on `PODCLI_CLOUD_SYNC=1` (off by default).
+  - YouTube, if you link it: read-only analytics requests.
+  - podcli multicam cloud, if you run `podcli multicam --cloud`: per-camera proxies, a mic mix, and the transcript.
+- Free and open source under AGPL-3.0. Exports are unlimited, full quality, and watermark-free.
+- Agent-native. 32 MCP tools let Claude Code or Codex drive the whole flow, from transcription to rendered clips and publish-ready titles.
+- A knowledge base keeps titles, captions, and descriptions in your show's voice, and stops the engine from resuggesting moments you already published.
+- DaVinci Resolve handoff. Export any clip as FCPXML when you want to finish the edit yourself.
+
+## Use it from your agent
+
+podcli is an [MCP](https://modelcontextprotocol.io) server, so an agent can transcribe, suggest clips, and render them through conversation.
+
+```bash
+podcli mcp install    # registers it with Claude Code and Codex, whichever CLI is on PATH
+```
+
+`--help` and `--version` never download anything. First run of `process`, `studio`, `transcribe`, or `multicam` provisions the engine. `podcli mcp` does not, because stdout is JSON-RPC. Run `podcli setup` once before you point an agent at it.
+
+```bash
+podcli process episode.mp4 --json --yes
+podcli doctor --json
+```
+
+`--json` writes one object to stdout and logs to stderr. `-y/--yes` skips prompts. `NO_COLOR=1` (or a non-TTY) turns off colour and spinners.
+
+`rank_clip_candidates` returns a shortlist so the agent does not have to read the whole transcript. `process_episode` runs the pipeline as one job; poll it with `job_status`. The workflow lives in [SKILL.md](SKILL.md). Tool names are generated into [llms.txt](llms.txt).
+
+Claude Desktop and Codex setup is in the [MCP docs](https://podcli.com/docs/mcp-server).
+
+## Content workflow
+
+[PodStack](https://github.com/nmbrthirteen/podstack) ships with podcli as a set of Claude Code slash commands. They take a transcript to a publish-ready package: scored moments, titles, descriptions, thumbnail briefs, a brand review, and a publish checklist.
+
+```
+/produce-shorts
+```
+
+The commands live in `.claude/commands/`. [CLAUDE.md](CLAUDE.md) describes each one.
+
+## Docs
+
+| Guide | What's in it |
+| ----- | ------------ |
+| [Getting started](https://podcli.com/docs) | Install, first episode, the whole flow |
+| [The studio](https://podcli.com/docs/the-studio) | Web UI: library, episodes, content, highlights |
+| [CLI](https://podcli.com/docs/cli) | Commands, flags, presets, assets |
+| [MCP server](https://podcli.com/docs/mcp-server) | Agent setup and available tools |
+| [Captions and formats](https://podcli.com/docs/captions-and-formats) | Styles, aspect ratios, cropping |
+| [Configuration](docs/configuration.md) | Environment variables, config profiles, transcript format |
+
+Docs are open source at [nmbrthirteen/podcli-docs](https://github.com/nmbrthirteen/podcli-docs).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and conventions, and [RELEASE.md](RELEASE.md) for how releases are cut.
+
+## Credits
+
+Content workflow powered by [PodStack](https://github.com/nmbrthirteen/podstack), inspired by [gstack](https://github.com/garrytan/gstack) by Garry Tan.
+
+## License
+
+AGPL-3.0. See [LICENSE](LICENSE).
+
+Need podcli without AGPL terms? A commercial license is available. Email [siradze@nikusha.me](mailto:siradze@nikusha.me) with a one-line description of your use case.
